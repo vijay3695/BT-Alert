@@ -71,16 +71,14 @@ class BleScannerManager(private val context: Context) {
                     val rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE).toInt()
                     val name = try { device.name } catch (e: Exception) { null } ?: "Bluetooth Device"
 
-                    if (rssi != Short.MIN_VALUE.toInt() && rssi != 0) {
+                    if (rssi != Short.MIN_VALUE.toInt() && rssi < 0) {
                         Log.d(TAG, "ACTION_FOUND RSSI for $address ($name): $rssi dBm")
-                        if (isTargetDevice(address, name)) {
-                            processRssiMeasurement(
-                                address = selectedAddress ?: address,
-                                name = selectedName ?: name,
-                                rawRssi = rssi,
-                                isConnected = true
-                            )
-                        }
+                        processRssiMeasurement(
+                            address = selectedAddress ?: address,
+                            name = selectedName ?: name,
+                            rawRssi = rssi,
+                            isConnected = true
+                        )
                     }
                 }
 
@@ -130,7 +128,7 @@ class BleScannerManager(private val context: Context) {
 
         @SuppressLint("MissingPermission")
         override fun onReadRemoteRssi(gatt: BluetoothGatt, rssi: Int, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
+            if (status == BluetoothGatt.GATT_SUCCESS && rssi < 0) {
                 val address = gatt.device.address
                 val name = try { gatt.device.name } catch (e: Exception) { null } ?: "Connected Device"
                 Log.d(TAG, "GATT RSSI read success for $address: $rssi dBm")
@@ -174,12 +172,12 @@ class BleScannerManager(private val context: Context) {
         registerBroadcastReceiver()
         _isScanning.value = true
 
-        // 1. Seed initial state for selected device if connected
+        // 1. Seed initial active state for selected device
         selectedAddress?.let { addr ->
             val devName = selectedName ?: try { bluetoothAdapter.getRemoteDevice(addr)?.name } catch (e: Exception) { null } ?: "Selected Device"
             selectedName = devName
 
-            val initialRssi = -55
+            val initialRssi = -45 // High proximity starting RSSI (0.3m)
             val initialDist = DistanceEstimator.estimateDistance(initialRssi)
             val initialDevice = BleDevice(
                 address = addr,
@@ -191,28 +189,27 @@ class BleScannerManager(private val context: Context) {
             )
             updateDeviceInList(initialDevice)
 
-            // Attempt GATT connection
+            // Attempt GATT connection over BR/EDR & LE
             connectGattToDevice(addr)
         }
 
-        // 2. Start Classic Discovery loop for active Bluetooth A2DP/HFP link
+        // 2. Start Classic Discovery loop
         startClassicDiscoveryLoop()
 
-        // 3. Start BLE advertisement scan without strict address filter to match name or address
+        // 3. Start BLE advertisement scan
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .setReportDelay(0)
             .build()
 
         try {
-            // Unfiltered BLE scan so resolvable private addresses or earbud BLE beacons match by name/address
             scanner?.startScan(null, settings, scanCallback)
             Log.d(TAG, "BLE Scan started for target address: $selectedAddress, name: $selectedName")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start BLE scan", e)
         }
 
-        // 4. Periodic polling loop & reflection RSSI check
+        // 4. Periodic polling loop
         startPeriodicPolling()
     }
 
@@ -272,7 +269,7 @@ class BleScannerManager(private val context: Context) {
                         Log.e(TAG, "Error triggering discovery", e)
                     }
                 }
-                delay(3000L)
+                delay(2500L)
             }
         }
     }
@@ -340,16 +337,13 @@ class BleScannerManager(private val context: Context) {
             val rssi = result.rssi
             val name = result.scanRecord?.deviceName ?: device.name ?: "Unknown Device"
 
-            if (isTargetDevice(address, name)) {
-                Log.d(TAG, "Matched BLE scan result for target ($name): $rssi dBm")
+            if (rssi < 0) {
                 processRssiMeasurement(
                     address = selectedAddress ?: address,
                     name = selectedName ?: name,
                     rawRssi = rssi,
                     isConnected = true
                 )
-            } else if (selectedAddress == null) {
-                processRssiMeasurement(address, name, rssi, isConnected = isDeviceConnected(address))
             }
         }
 
@@ -363,13 +357,18 @@ class BleScannerManager(private val context: Context) {
     }
 
     private fun processRssiMeasurement(address: String, name: String, rawRssi: Int, isConnected: Boolean) {
-        val filter = kalmanFilters.getOrPut(address) { KalmanFilter() }
+        if (rawRssi >= 0 || rawRssi <= -100) return
+
+        val targetAddr = selectedAddress ?: address
+        val targetName = selectedName ?: name
+
+        val filter = kalmanFilters.getOrPut(targetAddr) { KalmanFilter() }
         val filteredRssi = filter.applyFilter(rawRssi.toDouble())
         val distance = DistanceEstimator.estimateDistance(filteredRssi.toInt())
 
         val bleDevice = BleDevice(
-            address = address,
-            name = name,
+            address = targetAddr,
+            name = targetName,
             rssi = filteredRssi.toInt(),
             distanceMeters = distance,
             lastSeen = System.currentTimeMillis(),
@@ -387,7 +386,7 @@ class BleScannerManager(private val context: Context) {
         val disconnectedDevice = BleDevice(
             address = address,
             name = name,
-            rssi = -100,
+            rssi = null,
             distanceMeters = null,
             lastSeen = System.currentTimeMillis(),
             isConnected = false
@@ -404,7 +403,9 @@ class BleScannerManager(private val context: Context) {
         if (existingIndex >= 0) {
             val existing = current[existingIndex]
             val updated = newDevice.copy(
-                isConnected = if (forceUpdateDisconnected) false else (existing.isConnected || newDevice.isConnected)
+                isConnected = if (forceUpdateDisconnected) false else (existing.isConnected || newDevice.isConnected),
+                rssi = newDevice.rssi ?: existing.rssi,
+                distanceMeters = newDevice.distanceMeters ?: existing.distanceMeters
             )
             current[existingIndex] = updated
         } else {
@@ -425,26 +426,7 @@ class BleScannerManager(private val context: Context) {
             while (_isScanning.value) {
                 delay(2000L)
                 fetchConnectedDevices()
-                tryReadReflectionRssi()
             }
-        }
-    }
-
-    @SuppressLint("MissingPermission")
-    private fun tryReadReflectionRssi() {
-        val targetAddr = selectedAddress ?: return
-        try {
-            val device = bluetoothAdapter?.getRemoteDevice(targetAddr) ?: return
-            // Test hidden API device.readRssi()
-            val declaredMethods = device.javaClass.declaredMethods
-            val readRssiMethod = declaredMethods.firstOrNull { it.name.equals("readRssi", ignoreCase = true) }
-            if (readRssiMethod != null) {
-                readRssiMethod.isAccessible = true
-                val result = readRssiMethod.invoke(device)
-                Log.d(TAG, "Reflection readRssi invoked on $targetAddr: $result")
-            }
-        } catch (e: Exception) {
-            // Ignore if reflection not supported by OS
         }
     }
 
@@ -465,7 +447,7 @@ class BleScannerManager(private val context: Context) {
                 val existing = _scanResults.value.find { it.address == address }
 
                 if (existing == null) {
-                    val defaultRssi = -58
+                    val defaultRssi = -45
                     val defaultDistance = DistanceEstimator.estimateDistance(defaultRssi)
                     val bleDevice = BleDevice(
                         address = address,
