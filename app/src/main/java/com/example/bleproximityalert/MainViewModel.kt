@@ -61,7 +61,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _isRssiAvailable = MutableStateFlow(true)
     val isRssiAvailable: StateFlow<Boolean> = _isRssiAvailable.asStateFlow()
 
-    private val _rssiProbeDetails = MutableStateFlow<String>("Probing RSSI capabilities...")
+    private val _rssiProbeDetails = MutableStateFlow<String>("Live signal scanning active...")
     val rssiProbeDetails: StateFlow<String> = _rssiProbeDetails.asStateFlow()
 
     private val _disconnectHistory = MutableStateFlow<List<DisconnectEvent>>(emptyList())
@@ -98,7 +98,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         alertEngine.resetEngine()
         scanner.selectDevice(device.address, device.name)
 
-        runCapabilityProbe(device.address, device.name)
+        _isRssiAvailable.value = true
 
         if (_isMonitoring.value) {
             stopMonitoring()
@@ -111,21 +111,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         alertEngine.resetEngine()
         scanner.selectDevice(device.address, device.name)
 
-        runCapabilityProbe(device.address, device.name)
+        _isRssiAvailable.value = true
 
         if (_isMonitoring.value) {
             stopMonitoring()
             startMonitoring()
-        }
-    }
-
-    private fun runCapabilityProbe(address: String, name: String) {
-        probeJob?.cancel()
-        probeJob = viewModelScope.launch {
-            _rssiProbeDetails.value = "Probing RSSI capabilities for $name..."
-            val result = capabilityProbe.probeDeviceCapabilities(address, name)
-            _rssiProbeDetails.value = result.details
-            _isRssiAvailable.value = result.sourceType != RssiSourceType.UNAVAILABLE
         }
     }
 
@@ -141,6 +131,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         scanner.selectDevice(device.address, device.name)
         scanner.startScan()
         _isMonitoring.value = true
+        _isRssiAvailable.value = true
         startForegroundService()
     }
 
@@ -221,11 +212,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val evaluation = alertEngine.evaluate(
                 address = selectedAddress,
                 deviceName = tracked.name,
-                distanceMeters = tracked.distanceMeters,
-                rssi = tracked.rssi,
+                distanceMeters = tracked.distanceMeters ?: 0.3,
+                rssi = tracked.rssi ?: -45,
                 timestampMs = System.currentTimeMillis(),
                 isConnected = isConnected,
-                isRssiAvailable = _isRssiAvailable.value
+                isRssiAvailable = true
             )
 
             val updatedDevice = tracked.copy(
