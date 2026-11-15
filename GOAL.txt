@@ -1,0 +1,80 @@
+PROJECT GOAL
+===========
+
+PROJECT: BLE Proximity Alert
+
+VISION
+------
+Build a cross-platform mobile app (Android first, iOS future) that monitors a connected Bluetooth device and proactively alerts the user when they are moving away from their phone and the Bluetooth signal is weakening. The app should predict imminent disconnection and warn the user before it happens.
+
+TARGET PLATFORMS
+----------------
+- Phase 1: Android (current)
+- Phase 2: iOS (future)
+- Technology choice rationale: Kotlin enables shared business logic with Kotlin Multiplatform (KMP) for future iOS expansion.
+
+CORE BEHAVIOR
+-------------
+1. The app detects Bluetooth devices that are ALREADY connected to the phone. It does not initiate new pairings.
+2. The user selects one connected device to monitor.
+3. While monitoring, the app continuously estimates distance from the phone using Bluetooth signal data (RSSI or any available Bluetooth metric).
+4. When the monitored device is moving away and the signal is dropping, the app warns the user BEFORE the connection drops.
+5. Warning must be delivered via VOICE (Text-to-Speech): "You have moved far from your phone" or equivalent.
+6. The app must be "smart": it should detect trends (signal degrading over time) and not just absolute distance, so it can warn the user seconds before disconnection.
+
+UI REQUIREMENTS
+---------------
+- Show a list of ALREADY CONNECTED Bluetooth devices for the user to select.
+- Show the currently monitored device with live signal strength (RSSI) and estimated distance.
+- Provide user-configurable distance thresholds for warnings.
+
+VOICE ALERT RULES
+-----------------
+- Use TTS to speak warnings.
+- Alert message when moving away: "Warning! You are moving far away from your phone!"
+- Alert when a critical threshold is crossed: "Your Bluetooth device is at [X] meters. It may disconnect soon."
+
+DISTANCE THRESHOLDS (USER CONFIGURABLE)
+---------------------------------------
+The user must be able to set warning distances. Supported options:
+- 9 meters
+- 8 meters
+- 7 meters
+- 6 meters
+- 5 meters
+- 4 meters
+- 3 meters
+- 2 meters
+- 1 meter
+- 0.5 meters
+- 0.1 meters (CRITICAL: warn that disconnection is imminent)
+
+CRITICAL ZONE BEHAVIOR
+-----------------------
+- Distances 0.5 meters and 0.1 meters are flagged as CRITICAL.
+- At these distances, the app must explicitly warn the user that the device may disconnect at any moment.
+- The app should predict imminent disconnection when signal is rapidly degrading, even if the device is still technically connected.
+
+SMART SIGNAL ANALYSIS
+---------------------
+- Use RSSI filtering (e.g., Kalman filter) to smooth noisy readings.
+- Estimate distance using a path-loss model or any available Bluetooth ranging data.
+- Detect degrading trend: if RSSI is consistently dropping over a short window, trigger an early warning.
+- Distinguish between: device is connected but far, vs. device is about to disconnect.
+
+NON-FUNCTIONAL REQUIREMENTS
+---------------------------
+- Must work as a foreground service so scanning continues when the app is backgrounded.
+- Must handle Android 12+ Bluetooth runtime permissions (BLUETOOTH_SCAN, BLUETOOTH_CONNECT, ACCESS_FINE_LOCATION).
+- Must handle Android 13+ POST_NOTIFICATIONS permission.
+- Must gracefully handle Bluetooth disabled state.
+- iOS future: design business logic to be portable to KMP so iOS can share distance estimation, alert logic, and threshold configuration.
+
+FUTURE ENHANCEMENTS (NOT IN SCOPE NOW)
+--------------------------------------
+- iOS implementation.
+- Beacon mode where the phone advertises and another device tracks it.
+- Custom alert sounds and voice selection.
+- Historical distance logging and statistics.
+- Multiple device monitoring.
+- Geofencing integration.
