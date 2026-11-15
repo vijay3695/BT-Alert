@@ -1,0 +1,2 @@
+-keep class com.example.bleproximityalert.** { *; }
+-dontwarn com.example.bleproximityalert.**
