@@ -13,7 +13,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import com.example.bleproximityalert.ui.AlertScreen
+import com.example.bleproximityalert.ui.CalibrationWizardScreen
 import com.example.bleproximityalert.ui.DeviceSelectionScreen
+import com.example.bleproximityalert.ui.DiagnosticsScreen
+import com.example.bleproximityalert.ui.DisconnectHistoryScreen
 import com.example.bleproximityalert.ui.MonitoringScreen
 import com.example.bleproximityalert.ui.PermissionRequestScreen
 import com.example.bleproximityalert.ui.SettingsScreen
@@ -24,7 +27,10 @@ enum class AppScreen {
     DEVICE_SELECTION,
     START_MONITORING,
     MONITORING,
-    SETTINGS
+    SETTINGS,
+    DIAGNOSTICS,
+    CALIBRATION,
+    DISCONNECT_HISTORY
 }
 
 class MainActivity : ComponentActivity() {
@@ -65,13 +71,31 @@ class MainActivity : ComponentActivity() {
                     activeScreen == AppScreen.SETTINGS -> {
                         SettingsScreen(
                             viewModel = viewModel,
-                            onBack = {
-                                activeScreen = if (selectedDevice != null) {
-                                    if (isMonitoring) AppScreen.MONITORING else AppScreen.START_MONITORING
-                                } else {
-                                    AppScreen.DEVICE_SELECTION
-                                }
-                            }
+                            onBack = { activeScreen = if (selectedDevice != null) AppScreen.START_MONITORING else AppScreen.DEVICE_SELECTION },
+                            onOpenDiagnostics = { activeScreen = AppScreen.DIAGNOSTICS },
+                            onOpenCalibration = { activeScreen = AppScreen.CALIBRATION },
+                            onOpenHistory = { activeScreen = AppScreen.DISCONNECT_HISTORY }
+                        )
+                    }
+
+                    activeScreen == AppScreen.DIAGNOSTICS -> {
+                        DiagnosticsScreen(
+                            viewModel = viewModel,
+                            onBack = { activeScreen = AppScreen.SETTINGS }
+                        )
+                    }
+
+                    activeScreen == AppScreen.CALIBRATION -> {
+                        CalibrationWizardScreen(
+                            viewModel = viewModel,
+                            onBack = { activeScreen = AppScreen.SETTINGS }
+                        )
+                    }
+
+                    activeScreen == AppScreen.DISCONNECT_HISTORY -> {
+                        DisconnectHistoryScreen(
+                            viewModel = viewModel,
+                            onBack = { activeScreen = AppScreen.SETTINGS }
                         )
                     }
 

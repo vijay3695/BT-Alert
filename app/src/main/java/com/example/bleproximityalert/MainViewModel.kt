@@ -1,12 +1,6 @@
 package com.example.bleproximityalert
 
-import android.annotation.SuppressLint
 import android.app.Application
-import android.bluetooth.BluetoothA2dp
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothHeadset
-import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothProfile
 import android.content.Context
 import android.content.Intent
 import android.os.Build
@@ -16,11 +10,19 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.bleproximityalert.alert.AlertEngine
 import com.example.bleproximityalert.alert.AlertEvaluation
-import com.example.bleproximityalert.alert.AlertLevel
 import com.example.bleproximityalert.alert.ThresholdConfig
 import com.example.bleproximityalert.ble.BleScannerManager
+import com.example.bleproximityalert.ble.RssiCapabilityProbe
+import com.example.bleproximityalert.ble.RssiSourceType
 import com.example.bleproximityalert.model.BleDevice
+import com.example.bleproximityalert.model.CalibrationModel
+import com.example.bleproximityalert.model.ConnectedAudioDevice
+import com.example.bleproximityalert.model.DisconnectEvent
+import com.example.bleproximityalert.model.ProximityState
 import com.example.bleproximityalert.service.BleForegroundService
+import com.example.bleproximityalert.util.CalibrationStorage
+import com.example.bleproximityalert.util.ConnectionMonitor
+import com.example.bleproximityalert.util.DisconnectRecorder
 import com.example.bleproximityalert.util.PermissionHelper
 import com.example.bleproximityalert.util.TextToSpeechHelper
 import kotlinx.coroutines.Job
@@ -32,10 +34,14 @@ import kotlinx.coroutines.launch
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val scanner = BleScannerManager(application)
     private val ttsHelper = TextToSpeechHelper(application)
+    private val connectionMonitor = ConnectionMonitor(application)
+    private val disconnectRecorder = DisconnectRecorder(application)
+    private val calibrationStorage = CalibrationStorage(application)
+    private val capabilityProbe = RssiCapabilityProbe(application)
+
     private var alertEngine = AlertEngine(loadThresholdConfig())
 
-    private val _pairedAudioDevices = MutableStateFlow<List<BleDevice>>(emptyList())
-    val pairedAudioDevices: StateFlow<List<BleDevice>> = _pairedAudioDevices.asStateFlow()
+    val connectedAudioDevices: StateFlow<List<ConnectedAudioDevice>> = connectionMonitor.connectedDevices
 
     private val _selectedDevice = MutableStateFlow<BleDevice?>(null)
     val selectedDevice: StateFlow<BleDevice?> = _selectedDevice.asStateFlow()
@@ -52,144 +58,74 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _thresholdConfig = MutableStateFlow(alertEngine.config)
     val thresholdConfig: StateFlow<ThresholdConfig> = _thresholdConfig.asStateFlow()
 
+    private val _isRssiAvailable = MutableStateFlow(true)
+    val isRssiAvailable: StateFlow<Boolean> = _isRssiAvailable.asStateFlow()
+
+    private val _rssiProbeDetails = MutableStateFlow<String>("Probing RSSI capabilities...")
+    val rssiProbeDetails: StateFlow<String> = _rssiProbeDetails.asStateFlow()
+
+    private val _disconnectHistory = MutableStateFlow<List<DisconnectEvent>>(emptyList())
+    val disconnectHistory: StateFlow<List<DisconnectEvent>> = _disconnectHistory.asStateFlow()
+
     private var scanJob: Job? = null
+    private var disconnectObserverJob: Job? = null
+    private var probeJob: Job? = null
 
     init {
         checkPermissions()
         startObservingScanResults()
+        startObservingDisconnections()
+        refreshDisconnectHistory()
     }
 
     fun checkPermissions() {
         _hasPermissions.value = PermissionHelper.hasRequiredBluetoothPermissions(getApplication())
     }
 
-    @SuppressLint("MissingPermission")
     fun loadPairedAudioDevices() {
-        if (!PermissionHelper.hasRequiredBluetoothPermissions(getApplication())) {
-            Log.e("MainViewModel", "Cannot load devices: missing permissions")
-            return
-        }
-
-        val bluetoothManager = getApplication<Application>().getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-        val bluetoothAdapter = bluetoothManager?.adapter ?: return
-
-        val deviceMap = mutableMapOf<String, BleDevice>()
-
-        // 1. Fetch bonded (paired) devices
-        try {
-            val bondedDevices = bluetoothAdapter.bondedDevices ?: emptySet()
-            for (dev in bondedDevices) {
-                val address = dev.address
-                val name = try { dev.name } catch (e: Exception) { null } ?: "Bluetooth Device ($address)"
-                deviceMap[address] = BleDevice(
-                    address = address,
-                    name = name,
-                    isConnected = false
-                )
-            }
-        } catch (e: Exception) {
-            Log.e("MainViewModel", "Error reading bonded devices", e)
-        }
-
-        // 2. Fetch GATT connected devices
-        try {
-            val gattConnected = try { bluetoothManager.getConnectedDevices(BluetoothProfile.GATT) ?: emptyList() } catch (e: Exception) { emptyList() }
-            for (dev in gattConnected) {
-                val address = dev.address
-                val name = try { dev.name } catch (e: Exception) { null } ?: "Connected Device ($address)"
-                val existing = deviceMap[address]
-                deviceMap[address] = BleDevice(
-                    address = address,
-                    name = existing?.name ?: name,
-                    isConnected = true
-                )
-            }
-        } catch (e: Exception) {
-            Log.e("MainViewModel", "Error fetching GATT connected devices", e)
-        }
-
-        _pairedAudioDevices.value = deviceMap.values.toList().sortedWith(
-            compareByDescending<BleDevice> { it.isConnected }.thenBy { it.name }
-        )
-
-        // 3. Query A2DP profile for audio devices
-        try {
-            bluetoothAdapter.getProfileProxy(
-                getApplication(),
-                object : BluetoothProfile.ServiceListener {
-                    override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
-                        if (profile == BluetoothProfile.A2DP) {
-                            val a2dp = proxy as? BluetoothA2dp
-                            val connectedAudio = a2dp?.connectedDevices ?: emptyList()
-
-                            val currentMap = _pairedAudioDevices.value.associateBy { it.address }.toMutableMap()
-                            for (dev in connectedAudio) {
-                                val address = dev.address
-                                val name = try { dev.name } catch (e: Exception) { null } ?: "Earphones ($address)"
-                                currentMap[address] = BleDevice(
-                                    address = address,
-                                    name = name,
-                                    isConnected = true
-                                )
-                            }
-                            _pairedAudioDevices.value = currentMap.values.toList().sortedWith(
-                                compareByDescending<BleDevice> { it.isConnected }.thenBy { it.name }
-                            )
-                            try { bluetoothAdapter.closeProfileProxy(BluetoothProfile.A2DP, proxy) } catch (e: Exception) {}
-                        }
-                    }
-
-                    override fun onServiceDisconnected(profile: Int) {}
-                },
-                BluetoothProfile.A2DP
-            )
-        } catch (e: Exception) {
-            Log.e("MainViewModel", "Error fetching A2DP profile proxy", e)
-        }
-
-        // 4. Query Headset profile for voice audio devices
-        try {
-            bluetoothAdapter.getProfileProxy(
-                getApplication(),
-                object : BluetoothProfile.ServiceListener {
-                    override fun onServiceConnected(profile: Int, proxy: BluetoothProfile) {
-                        if (profile == BluetoothProfile.HEADSET) {
-                            val headset = proxy as? BluetoothHeadset
-                            val connectedHeadsets = headset?.connectedDevices ?: emptyList()
-
-                            val currentMap = _pairedAudioDevices.value.associateBy { it.address }.toMutableMap()
-                            for (dev in connectedHeadsets) {
-                                val address = dev.address
-                                val name = try { dev.name } catch (e: Exception) { null } ?: "Headset ($address)"
-                                currentMap[address] = BleDevice(
-                                    address = address,
-                                    name = name,
-                                    isConnected = true
-                                )
-                            }
-                            _pairedAudioDevices.value = currentMap.values.toList().sortedWith(
-                                compareByDescending<BleDevice> { it.isConnected }.thenBy { it.name }
-                            )
-                            try { bluetoothAdapter.closeProfileProxy(BluetoothProfile.HEADSET, proxy) } catch (e: Exception) {}
-                        }
-                    }
-
-                    override fun onServiceDisconnected(profile: Int) {}
-                },
-                BluetoothProfile.HEADSET
-            )
-        } catch (e: Exception) {
-            Log.e("MainViewModel", "Error fetching Headset profile proxy", e)
-        }
+        connectionMonitor.refreshConnectedDevices()
     }
 
-    fun selectDevice(device: BleDevice) {
-        _selectedDevice.value = device
-        alertEngine.reset(device.address)
+    fun selectDevice(device: ConnectedAudioDevice) {
+        val calibration = calibrationStorage.getCalibration(device.address)
+        val bleDevice = BleDevice(
+            address = device.address,
+            name = device.name,
+            isConnected = true,
+            isCurrentAudioOutput = device.isCurrentAudioOutput
+        )
+        _selectedDevice.value = bleDevice
+        alertEngine.resetEngine()
         scanner.selectDevice(device.address, device.name)
+
+        runCapabilityProbe(device.address, device.name)
+
         if (_isMonitoring.value) {
             stopMonitoring()
             startMonitoring()
+        }
+    }
+
+    fun selectBleDevice(device: BleDevice) {
+        _selectedDevice.value = device
+        alertEngine.resetEngine()
+        scanner.selectDevice(device.address, device.name)
+
+        runCapabilityProbe(device.address, device.name)
+
+        if (_isMonitoring.value) {
+            stopMonitoring()
+            startMonitoring()
+        }
+    }
+
+    private fun runCapabilityProbe(address: String, name: String) {
+        probeJob?.cancel()
+        probeJob = viewModelScope.launch {
+            _rssiProbeDetails.value = "Probing RSSI capabilities for $name..."
+            val result = capabilityProbe.probeDeviceCapabilities(address, name)
+            _rssiProbeDetails.value = result.details
+            _isRssiAvailable.value = result.sourceType != RssiSourceType.UNAVAILABLE
         }
     }
 
@@ -227,11 +163,49 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         saveThresholdConfig(newConfig)
     }
 
+    fun testTtsVoice() {
+        ttsHelper.speak("This is a test of the proximity alert voice inside your headphones.", requireBtSink = false)
+    }
+
+    fun saveCalibration(calibration: CalibrationModel) {
+        calibrationStorage.saveCalibration(calibration)
+    }
+
+    fun refreshDisconnectHistory() {
+        _disconnectHistory.value = disconnectRecorder.getEvents()
+    }
+
+    fun clearDisconnectHistory() {
+        disconnectRecorder.clearHistory()
+        refreshDisconnectHistory()
+    }
+
     private fun startObservingScanResults() {
         scanJob?.cancel()
         scanJob = viewModelScope.launch {
             scanner.scanResults.collect { results ->
                 evaluateSelectedDevice(results)
+            }
+        }
+    }
+
+    private fun startObservingDisconnections() {
+        disconnectObserverJob?.cancel()
+        disconnectObserverJob = viewModelScope.launch {
+            connectionMonitor.onDeviceDisconnected.collect { disconnectedAddr ->
+                if (disconnectedAddr != null && _selectedDevice.value?.address == disconnectedAddr) {
+                    val currentDev = _selectedDevice.value
+                    if (currentDev != null) {
+                        disconnectRecorder.recordDisconnect(
+                            deviceName = currentDev.name,
+                            deviceAddress = currentDev.address,
+                            lastRssi = currentDev.rssi,
+                            lastDistanceMeters = currentDev.distanceMeters
+                        )
+                        _selectedDevice.value = currentDev.copy(isConnected = false, state = ProximityState.DISCONNECTED)
+                        refreshDisconnectHistory()
+                    }
+                }
             }
         }
     }
@@ -242,43 +216,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         val tracked = results.firstOrNull { it.address == selectedAddress || (selectedName.isNotEmpty() && it.name.contains(selectedName, ignoreCase = true)) }
         if (tracked != null) {
-            _selectedDevice.value = tracked
+            val isConnected = connectionMonitor.isDeviceConnected(tracked.address) || tracked.isConnected
 
             val evaluation = alertEngine.evaluate(
                 address = selectedAddress,
+                deviceName = tracked.name,
                 distanceMeters = tracked.distanceMeters,
                 rssi = tracked.rssi,
                 timestampMs = System.currentTimeMillis(),
-                isConnected = tracked.isConnected
+                isConnected = isConnected,
+                isRssiAvailable = _isRssiAvailable.value
             )
 
-            if (evaluation.shouldAlert && tracked.isConnected) {
-                _alertDevice.value = tracked
-                val message = buildAlertMessage(evaluation, tracked)
-                ttsHelper.speak(message)
-            }
-        }
-    }
+            val updatedDevice = tracked.copy(
+                isConnected = isConnected,
+                state = evaluation.state,
+                trendSlopeDbmPerSec = evaluation.trendSlopeDbmPerSec
+            )
 
-    private fun buildAlertMessage(evaluation: AlertEvaluation, device: BleDevice): String {
-        val distVal = device.distanceMeters
-        val distanceText = if (distVal != null && distVal > 0) String.format("%.1f", distVal) else "unknown"
+            _selectedDevice.value = updatedDevice
 
-        return when (evaluation.level) {
-            AlertLevel.IMMINENT_DISCONNECT -> {
-                "Critical alert! Your Bluetooth device ${device.name} is at $distanceText meters. Disconnection is imminent!"
+            if (evaluation.shouldAlert && evaluation.voiceMessage != null && isConnected) {
+                _alertDevice.value = updatedDevice
+                ttsHelper.speak(evaluation.voiceMessage)
             }
-            AlertLevel.CRITICAL -> {
-                if (evaluation.trendDegrading) {
-                    "Warning! Signal to ${device.name} is rapidly dropping at $distanceText meters. Disconnection is likely soon!"
-                } else {
-                    "Warning! Your Bluetooth device ${device.name} is at $distanceText meters. It may disconnect soon."
-                }
-            }
-            AlertLevel.WARNING -> {
-                "Warning! You are moving far away from your phone! Current distance is $distanceText meters."
-            }
-            AlertLevel.NORMAL -> ""
         }
     }
 
@@ -320,8 +281,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         super.onCleared()
         stopMonitoring()
+        connectionMonitor.unregister()
         ttsHelper.shutdown()
         scanJob?.cancel()
+        disconnectObserverJob?.cancel()
+        probeJob?.cancel()
     }
 
     companion object {

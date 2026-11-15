@@ -1,116 +1,170 @@
 package com.example.bleproximityalert.alert
 
-data class RssiSample(
-    val rssi: Int,
-    val timestampMs: Long
+import com.example.bleproximityalert.model.ProximityState
+import com.example.bleproximityalert.util.TrendAnalyzer
+
+data class AlertEvaluation(
+    val state: ProximityState,
+    val shouldAlert: Boolean,
+    val distanceMeters: Double?,
+    val trendSlopeDbmPerSec: Double?,
+    val predictedSecondsToLoss: Double?,
+    val voiceMessage: String?
 )
 
-data class DeviceSignalState(
-    val address: String,
-    val samples: MutableList<RssiSample> = mutableListOf(),
-    var lastAlertLevel: AlertLevel = AlertLevel.NORMAL,
-    var lastAlertTimestampMs: Long = 0L
-) {
-    fun addSample(rssi: Int, timestampMs: Long) {
-        samples.add(RssiSample(rssi, timestampMs))
-        val cutoff = timestampMs - RSSI_DEGRADE_WINDOW_MS
-        while (samples.isNotEmpty() && samples.first().timestampMs < cutoff) {
-            samples.removeAt(0)
-        }
-        while (samples.size > 50) {
-            samples.removeAt(0)
-        }
-    }
-
-    fun isRssiDegrading(): Boolean {
-        if (samples.size < 2) return false
-        val recent = samples.takeLast(5)
-        val first = recent.first().rssi
-        val last = recent.last().rssi
-        return (first - last) >= RSSI_DEGRADE_THRESHOLD_DBM
-    }
-
-    fun clear() {
-        samples.clear()
-        lastAlertLevel = AlertLevel.NORMAL
-        lastAlertTimestampMs = 0L
-    }
-
-    companion object {
-        const val RSSI_DEGRADE_WINDOW_MS = 3000L
-        const val RSSI_DEGRADE_THRESHOLD_DBM = 4
-    }
-}
-
 class AlertEngine(val config: ThresholdConfig = ThresholdConfig()) {
-    private val states = mutableMapOf<String, DeviceSignalState>()
+    private val trendAnalyzer = TrendAnalyzer()
+
+    private var currentState: ProximityState = ProximityState.SAFE
+    private var candidateState: ProximityState = ProximityState.SAFE
+    private var candidateStateStartMs: Long = 0L
+
+    private var lastAlertTimestampMs: Long = 0L
+    private var lastAlertState: ProximityState = ProximityState.SAFE
 
     fun evaluate(
         address: String,
+        deviceName: String,
         distanceMeters: Double?,
-        rssi: Int,
-        timestampMs: Long,
-        isConnected: Boolean
+        rssi: Int?,
+        timestampMs: Long = System.currentTimeMillis(),
+        isConnected: Boolean,
+        isRssiAvailable: Boolean
     ): AlertEvaluation {
-        if (!isConnected || distanceMeters == null || distanceMeters < 0) {
+        if (!isConnected) {
+            resetEngine()
             return AlertEvaluation(
-                level = AlertLevel.NORMAL,
+                state = ProximityState.DISCONNECTED,
                 shouldAlert = false,
-                trendDegrading = false,
-                distanceMeters = distanceMeters
+                distanceMeters = null,
+                trendSlopeDbmPerSec = null,
+                predictedSecondsToLoss = null,
+                voiceMessage = null
             )
         }
 
-        val state = states.getOrPut(address) { DeviceSignalState(address) }
-        state.addSample(rssi, timestampMs)
-
-        val baseLevel = config.getAlertLevel(distanceMeters, rssi)
-        val trendDegrading = state.isRssiDegrading()
-
-        val effectiveLevel = when {
-            baseLevel == AlertLevel.IMMINENT_DISCONNECT -> AlertLevel.IMMINENT_DISCONNECT
-            baseLevel == AlertLevel.CRITICAL -> AlertLevel.CRITICAL
-            baseLevel == AlertLevel.WARNING && trendDegrading -> AlertLevel.CRITICAL
-            baseLevel == AlertLevel.WARNING -> AlertLevel.WARNING
-            trendDegrading && (distanceMeters >= config.warningDistanceMeters * 0.8) -> AlertLevel.WARNING
-            else -> AlertLevel.NORMAL
+        if (!isRssiAvailable || rssi == null || distanceMeters == null || distanceMeters < 0) {
+            return AlertEvaluation(
+                state = ProximityState.UNAVAILABLE,
+                shouldAlert = false,
+                distanceMeters = null,
+                trendSlopeDbmPerSec = null,
+                predictedSecondsToLoss = null,
+                voiceMessage = null
+            )
         }
 
-        val levelEscalated = effectiveLevel.ordinal > state.lastAlertLevel.ordinal
-        val cooldownPassed = (timestampMs - state.lastAlertTimestampMs) > 5000L
+        trendAnalyzer.addSample(rssi.toDouble(), timestampMs)
+        val slope = trendAnalyzer.calculateSlopeDbmPerSecond()
+        val secondsToLoss = trendAnalyzer.predictSecondsToLoss(rssi.toDouble())
 
-        val shouldAlert = effectiveLevel != AlertLevel.NORMAL && (levelEscalated || cooldownPassed)
+        val rawTargetState = when {
+            rssi <= -85 || (secondsToLoss != null && secondsToLoss <= 7.0) || distanceMeters >= 9.0 -> {
+                ProximityState.IMMINENT
+            }
+            secondsToLoss != null && secondsToLoss <= 20.0 -> {
+                ProximityState.LINK_RISK
+            }
+            distanceMeters >= config.warningDistanceMeters ||
+                    (distanceMeters >= config.warningDistanceMeters * 0.85 && slope != null && slope < -1.0) -> {
+                ProximityState.AT_LIMIT
+            }
+            slope != null && slope < -1.0 -> {
+                ProximityState.MOVING_AWAY
+            }
+            else -> {
+                // Hysteresis: only exit AT_LIMIT/MOVING_AWAY when distance is <= warningDistance * 0.85
+                if ((currentState == ProximityState.AT_LIMIT || currentState == ProximityState.MOVING_AWAY) &&
+                    distanceMeters > config.warningDistanceMeters * 0.85
+                ) {
+                    currentState
+                } else {
+                    ProximityState.SAFE
+                }
+            }
+        }
 
-        val evaluation = AlertEvaluation(
-            level = effectiveLevel,
-            shouldAlert = shouldAlert,
-            trendDegrading = trendDegrading,
-            distanceMeters = distanceMeters
-        )
+        // Debounce logic: Candidate condition must remain true for required duration
+        val requiredDebounceMs = when (rawTargetState) {
+            ProximityState.IMMINENT -> 1000L
+            ProximityState.LINK_RISK -> 1500L
+            ProximityState.AT_LIMIT, ProximityState.MOVING_AWAY -> 2000L
+            else -> 0L
+        }
 
+        if (rawTargetState != candidateState) {
+            candidateState = rawTargetState
+            candidateStateStartMs = timestampMs
+        }
+
+        val stateSustainedDuration = timestampMs - candidateStateStartMs
+        if (stateSustainedDuration >= requiredDebounceMs) {
+            currentState = rawTargetState
+        }
+
+        // Cooldown evaluation per state
+        val cooldownMs = when (currentState) {
+            ProximityState.IMMINENT -> 10000L
+            ProximityState.LINK_RISK -> 20000L
+            ProximityState.AT_LIMIT -> 30000L
+            ProximityState.MOVING_AWAY -> 45000L
+            else -> 60000L
+        }
+
+        val stateEscalated = currentState.ordinal > lastAlertState.ordinal
+        val cooldownPassed = (timestampMs - lastAlertTimestampMs) > cooldownMs
+
+        val shouldAlert = (currentState != ProximityState.SAFE && currentState != ProximityState.UNAVAILABLE) &&
+                (stateEscalated || cooldownPassed)
+
+        var voiceMessage: String? = null
         if (shouldAlert) {
-            state.lastAlertLevel = effectiveLevel
-            state.lastAlertTimestampMs = timestampMs
-        } else if (effectiveLevel == AlertLevel.NORMAL) {
-            state.lastAlertLevel = AlertLevel.NORMAL
+            lastAlertTimestampMs = timestampMs
+            lastAlertState = currentState
+            voiceMessage = buildPoliteVoicePhrase(currentState, deviceName, distanceMeters)
+        } else if (currentState == ProximityState.SAFE) {
+            lastAlertState = ProximityState.SAFE
         }
 
-        return evaluation
+        return AlertEvaluation(
+            state = currentState,
+            shouldAlert = shouldAlert,
+            distanceMeters = distanceMeters,
+            trendSlopeDbmPerSec = slope,
+            predictedSecondsToLoss = secondsToLoss,
+            voiceMessage = voiceMessage
+        )
     }
 
-    fun reset(address: String) {
-        states.remove(address)?.clear()
+    private fun buildPoliteVoicePhrase(
+        state: ProximityState,
+        deviceName: String,
+        distanceMeters: Double
+    ): String {
+        val distText = String.format("%.1f", distanceMeters)
+        return when (state) {
+            ProximityState.MOVING_AWAY -> {
+                "Your headphones are getting farther away. Current distance is about $distText meters. Please keep your phone nearby."
+            }
+            ProximityState.AT_LIMIT -> {
+                "You are near your headphone alert distance of $distText meters. Please keep your phone with you."
+            }
+            ProximityState.LINK_RISK -> {
+                "The headphone connection is getting weak at $distText meters. You may lose audio soon."
+            }
+            ProximityState.IMMINENT -> {
+                "Please move closer to your headphones to avoid losing the connection."
+            }
+            else -> ""
+        }
     }
 
-    fun resetAll() {
-        states.values.forEach { it.clear() }
-        states.clear()
+    fun resetEngine() {
+        trendAnalyzer.clear()
+        currentState = ProximityState.SAFE
+        candidateState = ProximityState.SAFE
+        candidateStateStartMs = 0L
+        lastAlertTimestampMs = 0L
+        lastAlertState = ProximityState.SAFE
     }
 }
-
-data class AlertEvaluation(
-    val level: AlertLevel,
-    val shouldAlert: Boolean,
-    val trendDegrading: Boolean,
-    val distanceMeters: Double?
-)

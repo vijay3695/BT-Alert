@@ -2,11 +2,13 @@ package com.example.bleproximityalert.util
 
 import android.content.Context
 import android.media.AudioAttributes
+import android.media.AudioDeviceInfo
 import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import java.util.Locale
 
@@ -14,6 +16,7 @@ class TextToSpeechHelper(private val context: Context) {
     private var textToSpeech: TextToSpeech? = null
     private var isInitialized = false
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+    private var activeFocusRequest: AudioFocusRequest? = null
 
     init {
         initialize()
@@ -30,16 +33,44 @@ class TextToSpeechHelper(private val context: Context) {
                         .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                         .build()
                     textToSpeech?.setAudioAttributes(attrs)
-                    textToSpeech?.setSpeechRate(1.0f)
+                    textToSpeech?.setSpeechRate(0.9f)
                     textToSpeech?.setPitch(1.0f)
+
+                    textToSpeech?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                        override fun onStart(utteranceId: String?) {}
+                        override fun onDone(utteranceId: String?) {
+                            abandonAudioFocus()
+                        }
+                        override fun onError(utteranceId: String?) {
+                            abandonAudioFocus()
+                        }
+                    })
                 }
             }
         }
     }
 
-    fun speak(text: String) {
+    fun hasBluetoothMediaSink(): Boolean {
+        val am = audioManager ?: return false
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any { info ->
+                info.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+                        info.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            am.isBluetoothA2dpOn || am.isBluetoothScoOn
+        }
+    }
+
+    fun speak(text: String, requireBtSink: Boolean = true) {
         if (!isInitialized) {
             Log.w(TAG, "TTS not initialized")
+            return
+        }
+
+        if (requireBtSink && !hasBluetoothMediaSink()) {
+            Log.w(TAG, "Speech suppressed: No active Bluetooth media sink connected")
             return
         }
 
@@ -49,7 +80,7 @@ class TextToSpeechHelper(private val context: Context) {
             putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
         }
 
-        textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "proximity_alert_tts")
+        textToSpeech?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "proximity_alert_tts_" + System.currentTimeMillis())
     }
 
     private fun requestAudioFocus() {
@@ -63,6 +94,7 @@ class TextToSpeechHelper(private val context: Context) {
                             .build()
                     )
                     .build()
+                activeFocusRequest = focusRequest
                 audioManager?.requestAudioFocus(focusRequest)
             } else {
                 @Suppress("DEPRECATION")
@@ -77,12 +109,28 @@ class TextToSpeechHelper(private val context: Context) {
         }
     }
 
+    private fun abandonAudioFocus() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && activeFocusRequest != null) {
+                audioManager?.abandonAudioFocusRequest(activeFocusRequest!!)
+                activeFocusRequest = null
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager?.abandonAudioFocus(null)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error abandoning audio focus", e)
+        }
+    }
+
     fun stop() {
         textToSpeech?.stop()
+        abandonAudioFocus()
     }
 
     fun shutdown() {
         textToSpeech?.shutdown()
+        abandonAudioFocus()
         isInitialized = false
     }
 

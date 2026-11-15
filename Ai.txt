@@ -1,0 +1,1105 @@
+# BLE Proximity Alert — Full Rework, Fixes, and AI-Agent Implementation Guide
+
+> **Important / no assumptions:** I do not have direct file-editing access to the linked GitHub repo in this chat. This is the complete Markdown handoff for the AI agent. The agent must first inspect the real repo, run the capability checks below, and only then change code. **Do not edit Gradle files. Do not add Gradle dependencies without separate approval.**
+
+**Save this as:** `BLE_PROXIMITY_ALERT_REWORK.md`
+
+---
+
+## 1. Executive Summary — Why the Current App Fails
+
+The current design has a basic technical problem:
+
+1. **Android does not reliably expose RSSI for an already-connected Classic Bluetooth audio link (A2DP/HFP).**
+   - `BluetoothLeScanner` only sees BLE advertising. Connected Classic headphones usually stop BLE advertising.
+   - `BluetoothAdapter.startDiscovery()` is Classic inquiry. It is unreliable, slow, battery-heavy, interrupts audio, and usually will not give useful live RSSI for an already-connected headset.
+   - `BluetoothGatt.readRemoteRssi()` only works for a GATT connection. Many headphones do not expose a usable GATT connection while acting as A2DP/HFP audio devices. If GATT cannot connect, there is no RSSI source.
+   - Therefore the app cannot promise exact distance for every headset. The correct fix is: **probe for RSSI support, use it if available, otherwise show “proximity unavailable” and still provide connection-loss + last-known-location features.**
+
+2. **The fixed RSSI-to-distance formula is not real distance.**
+   - `txPower = -59`, `n = 2.2` is a guess. RSSI changes with body blocking, hand position, walls, head orientation, and headset firmware.
+   - A 1 m threshold is especially unreliable without per-device calibration.
+   - The app must show an **estimated range with confidence**, not “1.000 m”, and it must require calibration for small thresholds like 1 m.
+
+3. **The 1 m alert probably never fires because:**
+   - No usable RSSI source is actually arriving.
+   - A single noisy RSSI sample is being filtered incorrectly or reset.
+   - The device is not matched correctly.
+   - The service is not receiving updates.
+   - The alert logic uses distance but distance is stale/null.
+   - There is no debounce/hysteresis.
+
+4. **Disconnect detection is incomplete.**
+   - `ACTION_ACL_DISCONNECTED` alone is not enough. Need A2DP/headset profile state broadcasts, profile proxy connected-device checks, and AudioManager output-device checks.
+   - The app should mark disconnected, save last-known telemetry and location, and stop speaking after the headphones are gone.
+
+5. **TTS may play on the phone speaker or sound harsh.**
+   - Use `USAGE_MEDIA`, `CONTENT_TYPE_SPEECH`, `STREAM_MUSIC`, audio focus, and check that a Bluetooth media output exists before speaking.
+   - Use polite, calm phrases. Do not say “Move back now!” or similar.
+
+6. **Repeated scanning kills battery.**
+   - Remove periodic `startDiscovery()`.
+   - Do not run continuous BLE scans in production.
+   - Use one GATT RSSI connection if supported, adaptive polling, and one-shot GPS only on disconnect.
+
+---
+
+## 2. Product Truth to Show the User
+
+Do not hide this. The UI must say it clearly:
+
+- “Bluetooth signal can estimate proximity, not exact distance.”
+- “For reliable 1 m alerts, calibrate with your headphones.”
+- “If this headset does not expose signal strength to Android, this app can detect disconnection and save the last location, but it cannot warn before disconnection.”
+- “No Android app can guarantee 0.1 m Bluetooth distance accuracy with standard A2DP/HFP earphones.”
+
+This is not a minor caveat — it prevents the app from faking data and appearing broken.
+
+---
+
+## 3. New Architecture
+
+```
++--------------------------------------------------------------+
+| ConnectionMonitor                                            |
+| - A2DP/HEADSET profile proxies                               |
+| - AudioManager output-device check                           |
+| - Broadcast receivers: profile state + ACL                   |
+| - Periodic 10s fallback poll                                 |
++---------------------------------+----------------------------+
+                                  |
+                                  v
++--------------------------------------------------------------+
+| RssiSourceManager                                            |
+| - Probe once per selected device                             |
+| - Priority 1: GATT readRemoteRssi if supported               |
+| - Priority 2: limited BLE scan fallback if device visible    |
+| - Priority 3: classic discovery only manual diagnostics      |
+| - If no source: UNAVAILABLE, no fake distance                |
++---------------------------------+----------------------------+
+                                  |
+                                  v
++--------------------------------------------------------------+
+| ProximityEngine                                              |
+| - Outlier rejection + median + Kalman/EMA                    |
+| - Per-device calibration: txPowerAt1m, pathLossExponent      |
+| - Distance estimate + confidence range                       |
+| - Trend slope, predicted link-loss seconds                   |
+| - Debounce, hysteresis, cooldowns                            |
++---------------------------------+----------------------------+
+                                  |
+                                  v
++--------------------------------------------------------------+
+| AlertEngine                                                  |
+| - SAFE / MOVING_AWAY / AT_LIMIT / LINK_RISK / IMMINENT        |
+| - Polite TTS only if BT media route exists                   |
+| - Notification UI                                            |
++---------------------------------+----------------------------+
+                                  |
+                                  v
++--------------------------------------------------------------+
+| DisconnectRecorder                                           |
+| - Confirm disconnect                                         |
+| - Save last RSSI/distance/time                               |
+| - One-shot GPS location if permitted                         |
+| - Notification with "Open last location"                     |
++--------------------------------------------------------------+
+```
+
+---
+
+## 4. Mandatory First Step: RSSI Capability Probe
+
+The agent must not assume the headset supports GATT RSSI. Add a hidden or visible **Diagnostics → Test this headset** screen and run this probe before implementing alerts.
+
+### Probe procedure
+
+For the selected connected headset:
+
+1. Read connected devices from:
+   - `BluetoothA2dp.getConnectedDevices()`
+   - `BluetoothHeadset.getConnectedDevices()`
+   - `AudioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)`
+
+2. Try a single GATT connection:
+   - `device.connectGatt(context, false, callback, TRANSPORT_AUTO)`
+   - If that fails, optionally try `TRANSPORT_LE` or `TRANSPORT_BREDR` once each.
+   - Wait up to 8 seconds.
+   - On connected, call `gatt.readRemoteRssi()` 3–5 times with 1–2 s between reads.
+   - Record: success count, RSSI values, GATT status, failure reason.
+
+3. While connected, run a **limited** BLE scan for 5 seconds and look for the exact MAC address. If the device is not visible, do not keep scanning. Name matching is not reliable because names are duplicated and BLE addresses can rotate.
+
+4. Run Classic discovery only from a manual diagnostics button, never continuously. Cap it at 10 seconds and stop it. Log whether the device appears. Do not use it as the production source.
+
+### Result handling
+
+| Probe result | App behavior |
+|---|---|
+| GATT RSSI works | Use GATT RSSI; display “RSSI source: GATT”; allow approximate distance after calibration |
+| BLE scan sees same device | Use limited scan bursts; mark source as “BLE advertisement”; stop when not visible |
+| No RSSI source | Set `ProximityState.UNAVAILABLE`; hide exact distance; keep disconnect detection + last location. Show “This headset does not expose signal strength to Android.” |
+| Classic discovery only | Allow only for diagnostics/manual check; do not use for live alerts |
+
+**Critical:** If no RSSI source exists, do not silently substitute a guessed distance. That is the primary bug.
+
+---
+
+## 5. Manifest and Runtime Permissions
+
+The agent may edit the Manifest. **Do not edit Gradle.**
+
+Use only permissions required by the feature. `ACCESS_BACKGROUND_LOCATION` is sensitive and optional. Add it only if the user enables “Save location when app is in background”. The app must still work if it is denied.
+
+```xml
+<uses-feature android:name="android.hardware.bluetooth" android:required="true" />
+
+<uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+<uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+<uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
+<uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+<uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+<uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+<!-- Optional: only if user enables background last-location saving. -->
+<uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+
+<uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+
+<service
+    android:name=".service.BleForegroundService"
+    android:exported="false"
+    android:foregroundServiceType="connectedDevice|location" />
+```
+
+### Foreground service notes
+
+- On Android 13+, request `POST_NOTIFICATIONS` at runtime before starting the service notification.
+- On Android 12+, request `BLUETOOTH_SCAN` and `BLUETOOTH_CONNECT` at runtime.
+- On Android 14+, `foregroundServiceType` must match the declared permissions. Start the service only after required permissions are granted.
+- If location is denied, start the service with `connectedDevice` only and show “Last disconnect location unavailable”.
+- Do not start an FGS location type unless you actually use location. If using location, request one-shot location only on disconnect, not continuously.
+- For API 33+ receivers, use `Context.RECEIVER_NOT_EXPORTED` when registering. Support the older overload for older SDKs.
+- Do not use `usesPermissionFlags="neverForLocation"` on `BLUETOOTH_SCAN` if you are also using location for disconnect recording; this creates a confusing privacy/runtime trade-off. Choose based on final product policy and document it.
+
+---
+
+## 6. Connected Device Detection — Replace Weak Logic
+
+Create a single source of truth class, e.g. `ConnectionMonitor`. It must observe all of these:
+
+1. `BluetoothManager.getAdapter()`
+2. `BluetoothAdapter.getProfileProxy(...)` for `BluetoothProfile.A2DP`
+3. `BluetoothAdapter.getProfileProxy(...)` for `BluetoothProfile.HEADSET`
+4. `BluetoothA2dp.getConnectedDevices()`
+5. `BluetoothHeadset.getConnectedDevices()`
+6. `AudioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)`
+7. Broadcast receivers:
+   - `BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED`
+   - `BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED`
+   - `BluetoothDevice.ACTION_ACL_CONNECTED`
+   - `BluetoothDevice.ACTION_ACL_DISCONNECTED`
+   - `BluetoothDevice.ACTION_ACL_DISCONNECT_REQUESTED`
+   - `BluetoothAdapter.ACTION_STATE_CHANGED`
+8. A low-frequency fallback poll every 10 seconds while monitoring.
+
+### Data model
+
+```kotlin
+data class ConnectedAudioDevice(
+    val name: String?,
+    val address: String,
+    val supportsA2dp: Boolean,
+    val supportsHeadset: Boolean,
+    val isCurrentAudioOutput: Boolean
+)
+```
+
+### Important implementation rules
+
+- Match by address, not name, whenever possible.
+- A device name like `"WF-C500"` is not unique. Do not trust name-only matching.
+- Do not call `BluetoothAdapter.startDiscovery()` every 3 seconds. Delete that loop from production.
+- Do not call `getConnectedDevices(BluetoothProfile.GATT)` as the primary audio-device detector. It detects GATT connections, not A2DP/HFP audio connections.
+- Close profile proxies in `onDestroy()` or equivalent.
+- If the selected device disappears from all connected profiles/audio outputs, treat it as disconnected. Do not rely only on ACL broadcasts.
+- Add a 5-second grace period to avoid false disconnects from profile glitches, but if it remains absent, record the disconnect.
+
+---
+
+## 7. RSSI Acquisition — Use Only What Actually Works
+
+Create `RssiSourceManager`.
+
+### Priority order
+
+1. **GATT RSSI source** if the capability probe succeeds.
+2. **Limited BLE scan bursts** only if the exact device is genuinely visible while connected.
+3. **Manual diagnostic Classic discovery** only. Never production polling.
+
+### GATT source skeleton
+
+```kotlin
+@SuppressLint("MissingPermission")
+class GattRssiSource(
+    private val context: Context,
+    private val device: BluetoothDevice,
+    private val onRssi: (Int) -> Unit,
+    private val onUnavailable: (String) -> Unit
+) {
+    private var gatt: BluetoothGatt? = null
+    private var reading = false
+    private var failures = 0
+    private val handler = Handler(Looper.getMainLooper())
+
+    private val poll = object : Runnable {
+        override fun run() {
+            val g = gatt ?: return
+            if (!reading) {
+                reading = true
+                if (!g.readRemoteRssi()) {
+                    reading = false
+                    onUnavailable("readRemoteRssi() returned false")
+                }
+            }
+            handler.postDelayed(this, 2_000L)
+        }
+    }
+
+    fun start() {
+        try {
+            gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                device.connectGatt(
+                    context,
+                    false,
+                    callback,
+                    BluetoothDevice.TRANSPORT_AUTO
+                )
+            } else {
+                device.connectGatt(context, false, callback)
+            }
+        } catch (e: SecurityException) {
+            onUnavailable("Missing BLUETOOTH_CONNECT")
+        } catch (e: IllegalArgumentException) {
+            onUnavailable("GATT unsupported for this device")
+        }
+    }
+
+    private val callback = object : BluetoothGattCallback() {
+        override fun onConnectionStateChange(
+            gatt: BluetoothGatt,
+            status: Int,
+            newState: Int
+        ) {
+            if (newState == BluetoothProfile.STATE_CONNECTED) {
+                failures = 0
+                this@GattRssiSource.gatt = gatt
+                handler.removeCallbacks(poll)
+                handler.post(poll)
+            } else {
+                reading = false
+                this@GattRssiSource.gatt?.close()
+                this@GattRssiSource.gatt = null
+                failures++
+                onUnavailable("GATT disconnected, status=$status")
+            }
+        }
+
+        override fun onReadRemoteRssi(
+            gatt: BluetoothGatt,
+            rssi: Int,
+            status: Int
+        ) {
+            reading = false
+            if (status == BluetoothGatt.GATT_SUCCESS && rssi in -110..-20) {
+                onRssi(rssi)
+            } else {
+                failures++
+                onUnavailable("RSSI failed: status=$status rssi=$rssi")
+            }
+        }
+    }
+
+    fun stop() {
+        handler.removeCallbacksAndMessages(null)
+        try {
+            gatt?.disconnect()
+            gatt?.close()
+        } catch (_: Exception) {
+        } finally {
+            gatt = null
+        }
+    }
+}
+```
+
+### Scheduler / battery rules
+
+Use adaptive polling. Do not poll every 1 second forever.
+
+| Situation | Poll interval |
+|---|---|
+| No RSSI source | No RSSI polling. Connection monitor only. |
+| Safe, screen off | 8–12 s |
+| Safe, screen on | 4–6 s |
+| Within 1.5× warning threshold | 2–3 s |
+| Moving-away trend detected | 2 s |
+| LINK_RISK / IMMINENT | 1 s for a short window only |
+| After disconnect | Stop RSSI immediately |
+
+BLE scan fallback:
+- Run only in a short burst: 3–5 seconds.
+- Repeat no more than every 30–60 seconds.
+- Stop fully after 3–5 consecutive no-result bursts.
+- Never scan continuously.
+
+Remove:
+- periodic `startDiscovery()`
+- continuous unfiltered BLE scan
+- repeated GATT reconnects without exponential backoff
+- location polling while safe
+
+---
+
+## 8. Signal Filtering, Calibration, and Distance
+
+### 8.1 Filtering
+
+Pipeline:
+
+```
+raw RSSI -> reject invalid -> moving median (5 samples) -> Kalman or EMA -> trend window
+```
+
+Kalman example:
+
+```kotlin
+private var estimate = 0.0
+private var errorCov = 1.0
+private val processNoise = 0.05
+private val measurementNoise = 2.5
+
+fun update(raw: Double): Double {
+    errorCov += processNoise
+    val gain = errorCov / (errorCov + measurementNoise)
+    estimate += gain * (raw - estimate)
+    errorCov = (1.0 - gain) * errorCov
+    return estimate
+}
+```
+
+Maintain:
+- current raw RSSI
+- filtered RSSI
+- recent variance / standard deviation
+- sample count
+- last sample timestamp
+- trend slope in dBm/sec
+- source label
+
+Do not alert on one sample. Require at least 5 valid samples and 2 seconds of sustained condition.
+
+### 8.2 Per-device calibration
+
+Store one model per device address:
+
+```kotlin
+data class CalibrationModel(
+    val deviceAddress: String,
+    val txPowerAtOneMeterDbm: Double,
+    val pathLossExponent: Double,
+    val calibrated: Boolean,
+    val learnedDisconnectRssiDbm: Double? = null
+)
+```
+
+Calibration wizard:
+- Ask user to place phone and headphones at 1 m. Collect 20–30 RSSI samples over 10 s. Use the median.
+- Ask user to place them at 3 m. Collect 20–30 samples. Use the median.
+- Compute:
+
+```kotlin
+fun computeModel(
+    rssiAt1m: Double,
+    rssiAt3m: Double,
+    d2Meters: Double = 3.0
+): Pair<Double, Double> {
+    val n = (rssiAt1m - rssiAt3m) /
+        (10.0 * log10(d2Meters))
+    val clampedN = n.coerceIn(1.2, 4.5)
+    return rssiAt1m to clampedN
+}
+```
+
+- If the user only calibrates one point, keep `n = 2.0` and clearly mark confidence as low.
+- If no calibration exists, compute distance only for display as “rough” and do not promise sub-2 m accuracy. For the 1 m threshold, prompt: “Calibrate before using 1 m alerts.”
+
+Distance formula:
+
+```kotlin
+fun rssiToMeters(
+    rssiDbm: Double,
+    txPowerAtOneMeterDbm: Double,
+    pathLossExponent: Double
+): Double = 10.0.pow(
+    (txPowerAtOneMeterDbm - rssiDbm) /
+    (10.0 * pathLossExponent)
+)
+```
+
+Confidence range:
+
+```kotlin
+val sigma = sqrt(rssiVariance)
+val lowerMeters = rssiToMeters(filteredRssi + sigma, tx, n)
+val upperMeters = rssiToMeters(filteredRssi - sigma, tx, n)
+```
+
+Show:
+- `~1.2 m (likely 0.8–2.0 m, low confidence)`
+- Do not show `1.000 m`.
+- If `sigma` is high or samples are few: `Confidence: LOW`.
+- If no source: `Distance unavailable for this headset`.
+
+### 8.3 Trend detection
+
+Maintain a sliding window of timestamped filtered RSSI values.
+
+Use linear regression over the last 8–10 seconds with at least 5 samples:
+
+```kotlin
+fun slopeDbmPerSecond(samples: List<TimedRssi>): Double? {
+    if (samples.size < 5) return null
+    val t0 = samples.first().timeMs
+    val xs = samples.map { (it.timeMs - t0) / 1000.0 }
+    val ys = samples.map { it.rssi }
+    if (xs.last() - xs.first() < 3.0) return null
+    val xMean = xs.average()
+    val yMean = ys.average()
+    val numerator = xs.indices.sumOf { (xs[it] - xMean) * (ys[it] - yMean) }
+    val denominator = xs.indices.sumOf { (xs[it] - xMean) * (xs[it] - xMean) }
+    if (denominator == 0.0) return null
+    return numerator / denominator
+}
+```
+
+Negative slope means signal is getting weaker, i.e. moving away.
+
+Do not use “4 dBm drop in 3 s” as the only rule. It is noisy and can misfire.
+
+---
+
+## 9. Alert Engine — Polite, Debounced, Confidence-Aware
+
+### States
+
+```kotlin
+enum class ProximityState {
+    UNAVAILABLE,
+    SAFE,
+    MOVING_AWAY,
+    AT_LIMIT,
+    LINK_RISK,
+    IMMINENT,
+    DISCONNECTED
+}
+```
+
+### Decision logic
+
+```text
+If no RSSI source or stale sample (> 8 s)
+    -> UNAVAILABLE
+
+If device disconnected
+    -> DISCONNECTED
+
+If filteredRssi <= disconnectThreshold + 2 dBm
+    -> IMMINENT
+
+Else if predictedSecondsToLoss != null && predictedSecondsToLoss <= 7 s
+    -> IMMINENT
+
+Else if predictedSecondsToLoss != null && predictedSecondsToLoss <= 20 s
+    -> LINK_RISK
+
+Else if distance >= warningDistance
+    OR (distance >= warningDistance * 0.8 AND slope < -1.0 dBm/s)
+    -> AT_LIMIT
+
+Else if slope < -1.0 dBm/s for at least 2 s
+    -> MOVING_AWAY
+
+Else
+    -> SAFE
+```
+
+### Hysteresis and debounce
+
+- Enter warning when `distance >= threshold`.
+- Exit warning only when `distance <= threshold * 0.85`.
+- Require the candidate condition to remain true for 2 seconds before changing to `AT_LIMIT` or `LINK_RISK`.
+- Require 1 second for `IMMINENT`.
+- Cooldown TTS per state:
+  - `MOVING_AWAY`: 45 s
+  - `AT_LIMIT`: 30 s
+  - `LINK_RISK`: 20 s
+  - `IMMINENT`: 10 s
+- Never repeat the same sentence on every sample.
+- Escalation should speak once, then stay silent until state changes or cooldown expires.
+
+### Predicting imminent disconnection
+
+Use a learned disconnect RSSI threshold if available. When a disconnect occurs, store the last filtered RSSI for that device. Use the average of the last few disconnects, clamped to a safe range such as `-95..-70 dBm`.
+
+Formula:
+
+```kotlin
+fun secondsToLoss(
+    filteredRssi: Double,
+    slopeDbmPerSecond: Double?,
+    lossThresholdDbm: Double
+): Double? {
+    if (slopeDbmPerSecond == null || slopeDbmPerSecond >= -0.2) return null
+    val margin = filteredRssi - lossThresholdDbm
+    if (margin <= 0.0) return 0.0
+    return margin / (-slopeDbmPerSecond)
+}
+```
+
+Display:
+- “Connection risk: possible loss in ~12 s”
+- “Stream quality is dropping”
+- Never say “will disconnect in exactly 12 s”.
+
+If no RSSI is available, do not display prediction. Only notify after disconnection.
+
+---
+
+## 10. Text-to-Speech — Calm, Polite, and Routed Correctly
+
+### Voice phrases
+
+Use calm, non-commanding language:
+
+| State | Phrase |
+|---|---|
+| MOVING_AWAY | “Your headphones are getting farther away. Please keep your phone nearby.” |
+| AT_LIMIT | “You are near your headphone alert distance. Please keep your phone with you.” |
+| LINK_RISK | “The headphone connection is getting weak. You may lose audio soon.” |
+| IMMINENT | “Please move closer to your headphones to avoid losing the connection.” |
+| DISCONNECTED | Do not speak through headphones. Use a notification: “Headphones disconnected. Last known location saved.” |
+| TEST | “This is a test of the proximity alert voice.” |
+
+Do not use exclamation marks. Do not say “Move back now”. Do not use aggressive short commands.
+
+### TTS helper requirements
+
+- Initialize once in the service or application; do not create a new TTS engine for every alert.
+- Set:
+
+```kotlin
+val audioAttributes = AudioAttributes.Builder()
+    .setUsage(AudioAttributes.USAGE_MEDIA)
+    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+    .build()
+
+tts.setAudioAttributes(audioAttributes)
+tts.setSpeechRate(0.9f)
+tts.setPitch(1.0f)
+```
+
+- Request audio focus:
+
+```kotlin
+val focusRequest = AudioFocusRequest.Builder(
+    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+)
+    .setAudioAttributes(audioAttributes)
+    .setOnAudioFocusChangeListener { }
+    .build()
+
+audioManager.requestAudioFocus(focusRequest)
+```
+
+- Pass stream bundle for compatibility:
+
+```kotlin
+val params = Bundle().apply {
+    putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_MUSIC)
+}
+tts.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
+```
+
+- Before speaking, check for a Bluetooth media sink:
+
+```kotlin
+fun hasBluetoothMediaSink(am: AudioManager): Boolean {
+    return am.getDevices(AudioManager.GET_DEVICES_OUTPUTS).any { info ->
+        val name = info.typeName.lowercase()
+        info.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+            info.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+            name.contains("bluetooth") ||
+            name.contains("ble")
+    }
+}
+```
+
+- If no Bluetooth media sink exists:
+  - Do not speak proximity-on-headphones warnings.
+  - Show a notification instead.
+  - Do not play a proximity warning through the phone speaker unless the user explicitly enables “phone speaker fallback”.
+- Release audio focus in `UtteranceProgressListener.onDone()` / `onError()`.
+- Add a “Test voice on headphones” button in Settings. If it plays on the phone speaker, show: “Android is not routing media to the headset. Check headset connection.”
+
+---
+
+## 11. Disconnect Detection and GPS Last-Location
+
+### 11.1 Disconnect detection
+
+Treat the device as disconnected only when all reliable checks agree:
+
+1. It is absent from `BluetoothA2dp.connectedDevices`
+2. It is absent from `BluetoothHeadset.connectedDevices`
+3. It is absent from `AudioManager.getDevices(...)`
+4. ACL disconnected broadcast received, or profile state is `STATE_DISCONNECTED`
+5. It remains absent for a short grace period, e.g. 3–5 seconds
+
+If it reconnects within the grace period, do not save a disconnect event.
+
+On confirmed disconnect:
+- Stop RSSI source immediately.
+- Stop TTS, release audio focus.
+- Do not say “move closer” through the phone speaker.
+- Save the last known telemetry:
+  - timestamp
+  - device name/address
+  - last raw RSSI
+  - last filtered RSSI
+  - last estimated distance/range
+  - last source
+  - last state
+- Capture one-shot location, best effort.
+- Post a notification with:
+  - “Headphones disconnected”
+  - “Last known location saved at 10:42”
+  - Action: “Open last location”
+- If no location permission: “Location unavailable. Enable location permission to save disconnect location.”
+
+### 11.2 Location capture
+
+Do not track location continuously. Do this once per disconnect, with a timeout.
+
+```kotlin
+data class DisconnectEvent(
+    val timestampMs: Long,
+    val deviceName: String?,
+    val deviceAddress: String,
+    val lastRssi: Int?,
+    val lastDistanceMeters: Double?,
+    val latitude: Double?,
+    val longitude: Double?,
+    val accuracyMeters: Float?
+)
+```
+
+Implementation requirements:
+- Request `ACCESS_FINE_LOCATION` and `ACCESS_COARSE_LOCATION` at runtime.
+- `ACCESS_BACKGROUND_LOCATION` only if the user enables background last-location saving. Do not request it with the initial permission dialog.
+- Use `LocationManager` from the Android framework. Do not add Google Location dependency.
+- First try `getLastKnownLocation()` from GPS, network, and passive providers.
+- If last-known is older than 2 minutes, request one current fix with `requestSingleUpdate` or `getCurrentLocation`, timeout after 5–7 seconds, then fall back to the last known location.
+- Catch `SecurityException`.
+- If no location can be obtained, save the event with `latitude = null` and `longitude = null`.
+- Store at most 20 recent events in `SharedPreferences` as JSON. Do not add Room unless it already exists.
+- Add a “Clear history” button in the UI.
+- Open map using:
+
+```kotlin
+val uri = Uri.parse("geo:$lat,$lon?q=$lat,$lon($label)")
+context.startActivity(Intent(Intent.ACTION_VIEW, uri))
+```
+
+- Do not upload locations anywhere.
+- Show a privacy explanation before requesting background location.
+
+### 11.3 Notification
+
+Create separate channels:
+
+- `monitoring` — low importance, ongoing foreground service notification.
+- `alerts` — high importance for imminent warnings.
+- `disconnect_location` — default importance, one notification per saved disconnect.
+
+Do not use one noisy channel for everything.
+
+---
+
+## 12. UI / UX Rework
+
+Use the existing Compose structure. Do not add UI libraries through Gradle. Improve with existing Material components if present; otherwise use standard Compose UI.
+
+### Screen 1: Onboarding / Capability Warning
+
+Content:
+- “This app estimates proximity using Bluetooth signal. It is not exact GPS or laser distance.”
+- “Small thresholds like 1 m require calibration.”
+- “Some headphones do not expose signal strength to Android. The app will tell you if yours does.”
+- Buttons: `Continue`, `Run compatibility check`.
+
+### Screen 2: Permission Flow
+
+Request in this order:
+1. Bluetooth connect/scan
+2. Notifications (Android 13+)
+3. Foreground service permission is manifest-level
+4. Location while in use
+5. Optional background location, only if user enables last-location when app is closed
+
+Each permission needs a plain-language reason. If denied:
+- Do not crash.
+- Show exactly what is disabled.
+- Allow connection-only monitoring if RSSI is missing.
+- Allow app to run without background location.
+
+### Screen 3: Connected Device Selection
+
+Show:
+- Connected headset name
+- Address
+- Profile chips: A2DP, Headset, BLE output
+- Whether it is the current audio output
+- Button: `Use this headset`
+- Refresh button
+
+If no headset:
+- Explain “Connect your headphones in Android Bluetooth settings first.”
+- Do not try to pair devices from this app.
+
+### Screen 4: Start Monitoring
+
+Fields:
+- Selected device
+- Warning threshold: 0.5 m to 9 m
+- If threshold < 2 m and not calibrated: warning card “Calibrate for reliable close-range alerts”
+- Alert style: Voice + notification / Notification only
+- Voice test button
+- Power mode: Battery saver / Balanced / Responsive
+- Automatically save location on disconnect (toggle)
+- Start monitoring
+
+### Screen 5: Monitoring Screen
+
+Do not show a single fake number. Show a proximity card:
+
+```text
+Headphones: Sony WF-C500
+Status: Connected
+Signal source: GATT RSSI
+Estimated distance: ~1.2 m
+Likely range: 0.8–2.0 m
+Confidence: Medium
+Trend: Moving away slowly
+Link risk: Possible loss in ~18 s
+Last update: 1.1 s ago
+```
+
+Visual elements:
+- Big state label: `Safe`, `Moving away`, `Near limit`, `Connection at risk`, `Imminent`
+- A simple proximity bar or ring, not an exact “radar”.
+- Trend arrow.
+- Confidence badge.
+- Last known location button after disconnect.
+- Stop monitoring button.
+
+If source unavailable:
+
+```text
+Proximity unavailable for this headset
+Android is not receiving RSSI from WF-C500.
+The app can still:
+- detect when the headset disconnects
+- save the last known location
+- send a notification after disconnect
+```
+
+Show a button: `Run compatibility check again`.
+
+### Screen 6: Calibration
+
+Wizard steps:
+1. Choose device.
+2. Place phone and headphones at 1 m. Keep still. `Start 10-second sample`.
+3. Place at 3 m. `Start 10-second sample`.
+4. Show computed model and confidence.
+5. Save.
+6. Optional: test alert at threshold 1 m.
+
+Explain:
+- Remove obstacles.
+- Keep phone in the same orientation as normal use.
+- Calibration is stored per device.
+- Recalibrate if distance readings seem wrong.
+
+### Screen 7: Settings
+
+Sections:
+- Alert threshold
+- Sensitivity / debounce
+- Power mode
+- Voice
+  - Voice enabled
+  - Voice speed
+  - Test voice
+  - Cooldown interval
+- Calibration
+- Disconnect history
+- Location privacy
+- Diagnostics
+
+### Screen 8: Disconnect History
+
+List rows:
+- Device
+- Time
+- Last distance/RSSI
+- Location status
+- Button: Open map
+- Button: Delete
+
+If no location: “Location unavailable. Permission not granted or location services off.”
+
+### Screen 9: Diagnostics
+
+This is essential for debugging.
+
+Show:
+- Selected device address/name
+- A2DP connected?
+- Headset connected?
+- Audio output present?
+- GATT connected?
+- Last raw RSSI
+- Last filtered RSSI
+- RSSI source
+- Sample count
+- Last sample age
+- Distance estimate and range
+- Trend dBm/s
+- Current state
+- Predicted seconds to loss
+- Sound output device
+- `hasBluetoothMediaSink`
+- Permissions status
+- Last error
+
+Add buttons:
+- `Probe RSSI source`
+- `Test TTS route`
+- `Run one 10-second manual Classic discovery` (diagnostic only)
+- `Export diagnostic log` (plain text/share intent)
+
+---
+
+## 13. Battery-Saving Rules
+
+Use these rules and remove the old behavior:
+
+- Remove periodic `BluetoothAdapter.startDiscovery()` entirely from production.
+- Remove continuous `BluetoothLeScanner.startScan()`.
+- Use one GATT connection per selected device only if the probe proves it works.
+- Use adaptive RSSI polling intervals.
+- Stop RSSI polling immediately on disconnect.
+- Stop TTS processing when not in a warning state.
+- Do not hold a wakelock. The foreground service and Handler are enough.
+- Do not poll GPS continuously. Capture location only on disconnect.
+- Do not poll connected devices every second. Use broadcasts plus a 10 s fallback poll.
+- Do not run both BLE scan and GATT polling at the same time unless the probe explicitly requires fallback.
+- Add a Battery Saver mode that increases intervals and disables voice for low-severity states.
+
+---
+
+## 14. Agent Execution Checklist
+
+The coding agent must follow this order. Build after each major step. **Do not modify Gradle.**
+
+### Step 0 — Inspect without assuming
+
+Run searches for:
+
+```text
+BleScannerManager
+BleForegroundService
+AlertEngine
+Signal Processing
+KalmanFilter
+DistanceEstimator
+TextToSpeechHelper
+startDiscovery
+BluetoothLeScanner
+connectGatt
+readRemoteRssi
+ACTION_ACL_DISCONNECTED
+A2DP
+HEADSET
+MainActivity
+AppScreen
+```
+
+Record actual file paths and class names. If a name in this document does not exist, map it to the real class. Do not paste code blindly.
+
+### Step 1 — Add diagnostics first
+
+- Add a Diagnostics screen.
+- Add a capability probe.
+- Log the result.
+- Confirm whether the test headset gives usable GATT RSSI.
+- If no RSSI source: stop pretending distance is measured. Implement unavailable state.
+
+### Step 2 — Fix connection detection
+
+- Replace the current connected-device logic with A2DP + Headset + AudioManager + broadcasts.
+- Implement accurate disconnect state.
+- Ensure app knows immediately when the selected headset disconnects.
+- Add tests/logs for profile changes.
+
+### Step 3 — Remove bad scanning
+
+- Remove the periodic Classic discovery loop.
+- Remove continuous BLE scanning from production.
+- Keep a manual diagnostic scanning option only.
+
+### Step 4 — Implement RSSI source manager
+
+- Use GATT only if available.
+- Use limited BLE scan fallback only if visible.
+- Expose `UNAVAILABLE` honestly.
+- Handle `SecurityException`, failed GATT connections, and stale samples.
+
+### Step 5 — Replace distance engine
+
+- Implement median + Kalman/EMA.
+- Add per-device calibration.
+- Show distance only as an estimate with range and confidence.
+- Add stale-sample detection.
+
+### Step 6 — Replace alert engine
+
+- Implement states and hysteresis.
+- Implement debounce and cooldowns.
+- Remove any alert that triggers on one raw RSSI sample.
+- Add prediction using learned disconnect RSSI.
+- Make 1 m threshold require calibration or clearly warn.
+
+### Step 7 — Fix TTS
+
+- Use `USAGE_MEDIA` + `CONTENT_TYPE_SPEECH`.
+- Request audio focus.
+- Check Bluetooth media output before speaking.
+- Use polite phrases only.
+- Add a test voice button.
+- Never speak proximity warnings through the phone speaker unless explicit fallback is enabled.
+
+### Step 8 — Add disconnect GPS
+
+- Capture one-shot location on confirmed disconnect.
+- Store event locally.
+- Add notification with map intent.
+- Handle no permission gracefully.
+- Add history screen.
+
+### Step 9 — UI/UX rework
+
+- Add onboarding about Bluetooth distance limitations.
+- Add device selection.
+- Add monitoring card with confidence, trend, source, and staleness.
+- Add calibration wizard.
+- Add settings and disconnect history.
+- Add diagnostics.
+- Add empty states.
+
+### Step 10 — Battery verification
+
+- Check no repeated `startDiscovery`.
+- Check no continuous BLE scan.
+- Check no continuous location request.
+- Check GATT is closed on stop/disconnect.
+- Check foreground service is stopped when monitoring stops.
+
+### Step 11 — Build and acceptance test
+
+- Build debug without Gradle edits.
+- Test on a real Android phone with the actual Sony WF-C500.
+- Also test with another headset if possible.
+- Test screen off, app minimized, Bluetooth off/on, headset disconnected, permission denied, and no RSSI source.
+
+---
+
+## 15. Test Cases / Acceptance Criteria
+
+| Test | Expected result |
+|---|---|
+| Headset connects with A2DP | Device appears in selection |
+| Headset disconnects | App state becomes DISCONNECTED within a few seconds |
+| App has no RSSI source | Shows “Proximity unavailable”, does not show fake distance |
+| GATT RSSI works | Samples arrive; Diagnostics shows source GATT |
+| Uncalibrated, threshold 1 m | Warning shown: calibration required; no false precision |
+| Calibrated at 1 m and 3 m | Distance estimate and confidence are displayed |
+| User moves away | Trend indicator changes to moving away |
+| Warning threshold crossed | One voice alert after debounce, then cooldown |
+| User returns | State exits warning with hysteresis |
+| Headset disconnects | No TTS through phone speaker; notification saved |
+| Location permission granted | Disconnect event stores lat/lon and map opens |
+| Location permission denied | Event still saved without location; no crash |
+| App in background | Foreground service continues monitoring |
+| Screen off | Monitoring continues without excessive battery drain |
+| Bluetooth permissions denied | App explains what is disabled; no crash |
+| Android 13/14 notifications | Notification permission handled |
+| Android 14 FGS | Service starts with correct declared type |
+
+---
+
+## 16. What NOT To Do
+
+- Do not keep `startDiscovery()` every 3 seconds.
+- Do not run continuous BLE scans while connected.
+- Do not assume name matching is enough.
+- Do not show exact meters from an uncalibrated RSSI formula.
+- Do not display `0.1 m` precision.
+- Do not speak warnings on the phone speaker after headset disconnect unless explicitly enabled.
+- Do not reset last-known distance/location to null and lose the disconnect evidence.
+- Do not call `connectGatt()` repeatedly without closing previous GATT instances.
+- Do not add Gradle dependencies.
+- Do not block the main thread with Bluetooth polling.
+- Do not request continuous GPS for battery-heavy proximity monitoring.
+- Do not claim the app can predict exact disconnection time.
+- Do not hide the “RSSI unavailable” state from the user.
+
+---
+
+## 17. The Final Important Decision
+
+If your goal is **“warn me when my headphones are exactly 1 m away”**, the realistic Android solution is:
+
+1. The headset must expose usable GATT RSSI to Android, or BLE advertising must still be visible while connected.
+2. The app must be calibrated at 1 m and 3 m.
+3. The app must show a range and confidence, not a precise number.
+4. The alert must use debounce and trend detection.
+
+If the headset does **not** expose RSSI, no code can make exact Bluetooth distance work with standard Android public APIs. The honest fallback is:
+
+- Detect connection loss.
+- Save last-known GPS location.
+- Notify the user immediately.
+- Show that pre-disconnect proximity alerts are unavailable for that headset.
+
+That is the correct, finished behavior. Any implementation that claims otherwise is guessing.
+
+---
+
+**End of handoff document.**
