@@ -33,19 +33,19 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.example.bleproximityalert.MainViewModel
-import com.example.bleproximityalert.model.BleDevice
+import com.example.bleproximityalert.model.ConnectedAudioDevice
 
 @Composable
 fun DeviceSelectionScreen(
     viewModel: MainViewModel,
-    onDeviceSelected: (BleDevice) -> Unit,
+    onDeviceSelected: (ConnectedAudioDevice) -> Unit,
     onOpenSettings: () -> Unit
 ) {
     LaunchedEffect(Unit) {
         viewModel.loadPairedAudioDevices()
     }
 
-    val pairedDevices by viewModel.pairedAudioDevices.collectAsState()
+    val pairedDevices by viewModel.connectedAudioDevices.collectAsState()
 
     Column(
         modifier = Modifier
@@ -130,14 +130,14 @@ fun DeviceSelectionScreen(
 
 @Composable
 private fun DeviceCard(
-    device: BleDevice,
+    device: ConnectedAudioDevice,
     onSelect: () -> Unit
 ) {
     Card(
         onClick = onSelect,
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
-            containerColor = if (device.isConnected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
+            containerColor = if (device.isCurrentAudioOutput) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
         )
     ) {
         Row(
@@ -149,7 +149,7 @@ private fun DeviceCard(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = device.name,
+                    text = device.name ?: "Connected Device",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold
                 )
@@ -161,21 +161,19 @@ private fun DeviceCard(
                 )
             }
 
-            if (device.isConnected) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Icon(
-                        imageVector = Icons.Default.Info,
-                        contentDescription = "Connected",
-                        tint = MaterialTheme.colorScheme.primary
-                    )
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(
-                        text = "Connected",
-                        style = MaterialTheme.typography.labelMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    imageVector = Icons.Default.Info,
+                    contentDescription = "Connected",
+                    tint = MaterialTheme.colorScheme.primary
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = if (device.isCurrentAudioOutput) "Active Output" else "Connected",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
             }
         }
     }
