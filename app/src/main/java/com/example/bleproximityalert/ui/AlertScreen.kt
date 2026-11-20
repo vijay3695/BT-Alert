@@ -88,16 +88,15 @@ fun AlertScreen(
                     color = MaterialTheme.colorScheme.onErrorContainer
                 )
 
-                device?.distanceMeters?.let { dist ->
-                    if (dist > 0) {
-                        Spacer(modifier = Modifier.height(12.dp))
-                        Text(
-                            text = "Estimated Distance: ${String.format("%.1f", dist)} meters",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onErrorContainer
-                        )
-                    }
-                }
+                Spacer(modifier = Modifier.height(12.dp))
+                val distLine = device?.distanceMeters?.let { dist ->
+                    if (dist > 0) "Estimated Distance: ${String.format("%.1f", dist)} meters" else "Signal lost — device may be out of range"
+                } ?: "Signal lost — device may be out of range"
+                Text(
+                    text = distLine,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onErrorContainer
+                )
             }
         }
 

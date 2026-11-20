@@ -3,15 +3,19 @@ package com.example.bleproximityalert
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
+import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
 import com.example.bleproximityalert.ui.AlertScreen
 import com.example.bleproximityalert.ui.CalibrationWizardScreen
 import com.example.bleproximityalert.ui.DeviceSelectionScreen
@@ -38,8 +42,8 @@ class MainActivity : ComponentActivity() {
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { _ ->
-        viewModel.checkPermissions()
+    ) { result ->
+        viewModel.updatePermissionResult(result)
         if (viewModel.hasPermissions.value) {
             viewModel.loadPairedAudioDevices()
         }
@@ -47,18 +51,33 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) {
+            val context = LocalContext.current
+            val colorScheme = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+                dynamicDarkColorScheme(context)
+            } else {
+                darkColorScheme(
+                    primary = androidx.compose.ui.graphics.Color(0xFF2EC4B6),
+                    secondary = androidx.compose.ui.graphics.Color(0xFF7DD3C0),
+                    tertiary = androidx.compose.ui.graphics.Color(0xFFFF9F1C)
+                )
+            }
+            MaterialTheme(colorScheme = colorScheme) {
                 val hasPermissions by viewModel.hasPermissions.collectAsState()
                 val selectedDevice by viewModel.selectedDevice.collectAsState()
                 val isMonitoring by viewModel.isMonitoring.collectAsState()
                 val alertDevice by viewModel.alertDevice.collectAsState()
+                val deniedPermissions by viewModel.deniedPermissions.collectAsState()
 
-                var activeScreen by remember { mutableStateOf(AppScreen.DEVICE_SELECTION) }
+                var activeScreen by rememberSaveable { mutableStateOf(AppScreen.DEVICE_SELECTION) }
 
                 when {
                     !hasPermissions -> {
-                        PermissionRequestScreen(onRequest = { requestPermissions() })
+                        PermissionRequestScreen(
+                            deniedPermissions = deniedPermissions,
+                            onRequest = { requestPermissions() }
+                        )
                     }
 
                     alertDevice != null -> {
@@ -103,7 +122,7 @@ class MainActivity : ComponentActivity() {
                         DeviceSelectionScreen(
                             viewModel = viewModel,
                             onDeviceSelected = { device ->
-                                viewModel.selectDevice(device)
+                                viewModel.selectDevice(device.address, device.name, device.isCurrentAudioOutput)
                                 activeScreen = AppScreen.START_MONITORING
                             },
                             onOpenSettings = { activeScreen = AppScreen.SETTINGS }

@@ -20,7 +20,10 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
 import android.util.Log
+import com.example.bleproximityalert.model.ProximityState
 import com.example.bleproximityalert.model.BleDevice
+import com.example.bleproximityalert.model.CalibrationModel
+import com.example.bleproximityalert.model.ConfidenceLevel
 import com.example.bleproximityalert.util.DistanceEstimator
 import com.example.bleproximityalert.util.KalmanFilter
 import com.example.bleproximityalert.util.PermissionHelper
@@ -33,7 +36,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
-class BleScannerManager(private val context: Context) {
+class BleScannerManager private constructor(private val context: Context) {
     private val bluetoothManager: BluetoothManager? =
         context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
     private val bluetoothAdapter: BluetoothAdapter? = bluetoothManager?.adapter
@@ -57,6 +60,8 @@ class BleScannerManager(private val context: Context) {
     private val coroutineScope = CoroutineScope(Dispatchers.Main)
     private var pollingJob: Job? = null
     private var isReceiverRegistered = false
+    private var proximityState: ProximityState = ProximityState.SAFE
+    private var classicDiscoveryActive = false
 
     private val bluetoothReceiver = object : BroadcastReceiver() {
         @SuppressLint("MissingPermission")
@@ -71,11 +76,14 @@ class BleScannerManager(private val context: Context) {
                     val rssi = intent.getShortExtra(BluetoothDevice.EXTRA_RSSI, Short.MIN_VALUE).toInt()
                     val name = try { device.name } catch (e: Exception) { null } ?: "Bluetooth Device"
 
+                    // Only process results from the target device
+                    if (!isTargetDevice(address, name)) return
+
                     if (rssi != Short.MIN_VALUE.toInt() && rssi < 0) {
                         Log.d(TAG, "ACTION_FOUND RSSI for $address ($name): $rssi dBm")
                         processRssiMeasurement(
-                            address = selectedAddress ?: address,
-                            name = selectedName ?: name,
+                            address = address,
+                            name = name,
                             rawRssi = rssi,
                             isConnected = true
                         )
@@ -83,10 +91,14 @@ class BleScannerManager(private val context: Context) {
                 }
 
                 BluetoothAdapter.ACTION_DISCOVERY_FINISHED -> {
-                    if (_isScanning.value && bluetoothAdapter?.isEnabled == true) {
+                    // Only keep inquiring while the bounded classic-discovery
+                    // window is open. Previously this restarted discovery forever
+                    // every second, draining the battery while a connected
+                    // headset (which stops answering inquiry) never appeared.
+                    if (classicDiscoveryActive && _isScanning.value && bluetoothAdapter?.isEnabled == true) {
                         coroutineScope.launch {
                             delay(1000L)
-                            if (_isScanning.value && bluetoothAdapter?.isEnabled == true) {
+                            if (classicDiscoveryActive && _isScanning.value && bluetoothAdapter?.isEnabled == true) {
                                 try {
                                     bluetoothAdapter.startDiscovery()
                                 } catch (e: Exception) {
@@ -122,7 +134,12 @@ class BleScannerManager(private val context: Context) {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             Log.d(TAG, "GATT state change for ${gatt.device.address}: status=$status, newState=$newState")
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                // Only start polling after GATT connection is established
                 startGattRssiPolling()
+                // Also try reading RSSI immediately
+                try { gatt.readRemoteRssi() } catch (e: Exception) {}
+            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                stopGattRssiPolling()
             }
         }
 
@@ -155,7 +172,7 @@ class BleScannerManager(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    fun startScan() {
+    fun startScan(activeMonitoring: Boolean = true) {
         if (_isScanning.value) return
 
         if (!PermissionHelper.hasRequiredBluetoothPermissions(context)) {
@@ -163,48 +180,46 @@ class BleScannerManager(private val context: Context) {
             return
         }
 
-        scanner = bluetoothAdapter?.bluetoothLeScanner
         if (bluetoothAdapter?.isEnabled != true) {
             Log.e(TAG, "Bluetooth is disabled")
             return
         }
 
+        scanner = bluetoothAdapter?.bluetoothLeScanner
+
         registerBroadcastReceiver()
         _isScanning.value = true
 
-        // 1. Seed initial active state for selected device
+        // 1. Connect GATT to selected device for RSSI readings (no fake seed data)
         selectedAddress?.let { addr ->
             val devName = selectedName ?: try { bluetoothAdapter.getRemoteDevice(addr)?.name } catch (e: Exception) { null } ?: "Selected Device"
             selectedName = devName
-
-            val initialRssi = -45 // High proximity starting RSSI (0.3m)
-            val initialDist = DistanceEstimator.estimateDistance(initialRssi)
-            val initialDevice = BleDevice(
-                address = addr,
-                name = devName,
-                rssi = initialRssi,
-                distanceMeters = initialDist,
-                lastSeen = System.currentTimeMillis(),
-                isConnected = isDeviceConnected(addr)
-            )
-            updateDeviceInList(initialDevice)
 
             // Attempt GATT connection over BR/EDR & LE
             connectGattToDevice(addr)
         }
 
-        // 2. Start Classic Discovery loop
-        startClassicDiscoveryLoop()
+        // 2. Start Classic Discovery loop only if we don't already have a live result
+        //    for the selected device from the BLE scan. This avoids running both
+        //    radios when one is sufficient.
+        val hasTargetResult = _scanResults.value.any { it.address == selectedAddress }
+        if (!hasTargetResult) {
+            startClassicDiscoveryLoop(activeMonitoring)
+        }
 
-        // 3. Start BLE advertisement scan
+        // 3. Start BLE advertisement scan with a ScanFilter so the radio only wakes
+        //    for the target device instead of every nearby advertiser.
+        val scanMode = if (activeMonitoring) ScanSettings.SCAN_MODE_LOW_LATENCY else ScanSettings.SCAN_MODE_BALANCED
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setScanMode(scanMode)
             .setReportDelay(0)
             .build()
 
+        val filters = buildScanFilters()
+
         try {
-            scanner?.startScan(null, settings, scanCallback)
-            Log.d(TAG, "BLE Scan started for target address: $selectedAddress, name: $selectedName")
+            scanner?.startScan(filters, settings, scanCallback)
+            Log.d(TAG, "BLE Scan started (mode=${if (activeMonitoring) "LOW_LATENCY" else "BALANCED"}) for target address: $selectedAddress, name: $selectedName")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start BLE scan", e)
         }
@@ -214,8 +229,27 @@ class BleScannerManager(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
+    private fun buildScanFilters(): List<ScanFilter>? {
+        val filters = mutableListOf<ScanFilter>()
+        try {
+            selectedAddress?.let { addr ->
+                filters.add(ScanFilter.Builder().setDeviceAddress(addr).build())
+            }
+            if (filters.isEmpty()) {
+                selectedName?.let { name ->
+                    filters.add(ScanFilter.Builder().setDeviceName(name).build())
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to build scan filters", e)
+        }
+        return if (filters.isEmpty()) null else filters
+    }
+
+    @SuppressLint("MissingPermission")
     fun stopScan() {
         discoveryLoopJob?.cancel()
+        classicDiscoveryActive = false
         pollingJob?.cancel()
         stopGattRssiPolling()
         closeGatt()
@@ -254,23 +288,42 @@ class BleScannerManager(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    private fun startClassicDiscoveryLoop() {
+    private fun startClassicDiscoveryLoop(activeMonitoring: Boolean = true) {
         discoveryLoopJob?.cancel()
+        val loopDelay = if (activeMonitoring) 3000L else 6000L
+        // Classic inquiry is the only RSSI source for classic-only devices, but a
+        // connected headset usually stops answering inquiry — so bound the window.
+        // Probing forever only drains the battery.
+        val maxCycles = if (activeMonitoring) 7 else 12
+        classicDiscoveryActive = true
         discoveryLoopJob = coroutineScope.launch {
-            while (_isScanning.value) {
+            var cycle = 0
+            while (_isScanning.value && cycle < maxCycles) {
+                // If the BLE scan already produces a live reading for the target,
+                // classic inquiry is redundant — stop it.
+                val hasBleResult = _scanResults.value.any {
+                    it.address.equals(selectedAddress, ignoreCase = true) && it.rssi != null
+                }
+                if (hasBleResult) {
+                    Log.d(TAG, "BLE scan already provides live RSSI — stopping classic discovery")
+                    break
+                }
+                cycle++
                 if (bluetoothAdapter?.isEnabled == true) {
                     try {
                         if (bluetoothAdapter.isDiscovering) {
                             bluetoothAdapter.cancelDiscovery()
                         }
                         bluetoothAdapter.startDiscovery()
-                        Log.d(TAG, "Classic Bluetooth discovery triggered")
+                        Log.d(TAG, "Classic Bluetooth discovery triggered (cycle $cycle/$maxCycles)")
                     } catch (e: Exception) {
                         Log.e(TAG, "Error triggering discovery", e)
                     }
                 }
-                delay(2500L)
+                delay(loopDelay)
             }
+            classicDiscoveryActive = false
+            Log.d(TAG, "Classic discovery window closed after $cycle cycles")
         }
     }
 
@@ -287,7 +340,7 @@ class BleScannerManager(private val context: Context) {
             } else {
                 activeGattBredr = device.connectGatt(context, false, gattCallback)
             }
-            startGattRssiPolling()
+            // GATT RSSI polling will start in onConnectionStateChange when connected
         } catch (e: Exception) {
             Log.e(TAG, "Error connecting GATT to $address", e)
         }
@@ -298,15 +351,27 @@ class BleScannerManager(private val context: Context) {
         gattRssiJob?.cancel()
         gattRssiJob = coroutineScope.launch {
             while (_isScanning.value) {
+                // Stop polling when disconnected or RSSI unavailable — don't waste radio cycles.
+                if (proximityState == ProximityState.DISCONNECTED || proximityState == ProximityState.UNAVAILABLE) {
+                    delay(2000L)
+                    continue
+                }
                 try {
                     activeGattBredr?.readRemoteRssi()
                     activeGattLe?.readRemoteRssi()
                 } catch (e: Exception) {
                     Log.e(TAG, "Error reading GATT RSSI", e)
                 }
-                delay(1000L)
+                delay(gattPollingIntervalMs())
             }
         }
+    }
+
+    private fun gattPollingIntervalMs(): Long = when (proximityState) {
+        ProximityState.AT_LIMIT, ProximityState.LINK_RISK, ProximityState.IMMINENT -> 1000L
+        ProximityState.MOVING_AWAY -> 3000L
+        ProximityState.SAFE -> 5000L
+        else -> 5000L
     }
 
     private fun stopGattRssiPolling() {
@@ -337,10 +402,13 @@ class BleScannerManager(private val context: Context) {
             val rssi = result.rssi
             val name = result.scanRecord?.deviceName ?: device.name ?: "Unknown Device"
 
+            // Only process results from the target device
+            if (!isTargetDevice(address, name)) return
+
             if (rssi < 0) {
                 processRssiMeasurement(
-                    address = selectedAddress ?: address,
-                    name = selectedName ?: name,
+                    address = address,
+                    name = name,
                     rawRssi = rssi,
                     isConnected = true
                 )
@@ -366,11 +434,24 @@ class BleScannerManager(private val context: Context) {
         val filteredRssi = filter.applyFilter(rawRssi.toDouble())
         val distance = DistanceEstimator.estimateDistance(filteredRssi.toInt())
 
+        // Confidence from Kalman filter variance/sample count.
+        val confidence = filter.computeConfidence(filter.sampleCount(), false)
+
+        // Wire min/max range only when confidence is at least MEDIUM.
+        val range = if (confidence == ConfidenceLevel.MEDIUM || confidence == ConfidenceLevel.HIGH) {
+            DistanceEstimator.estimateRange(filteredRssi, filter.computeVariance())
+        } else {
+            null
+        }
+
         val bleDevice = BleDevice(
             address = targetAddr,
             name = targetName,
             rssi = filteredRssi.toInt(),
             distanceMeters = distance,
+            minDistanceMeters = range?.first,
+            maxDistanceMeters = range?.second,
+            confidence = confidence,
             lastSeen = System.currentTimeMillis(),
             isConnected = isConnected
         )
@@ -402,11 +483,19 @@ class BleScannerManager(private val context: Context) {
 
         if (existingIndex >= 0) {
             val existing = current[existingIndex]
-            val updated = newDevice.copy(
-                isConnected = if (forceUpdateDisconnected) false else (existing.isConnected || newDevice.isConnected),
-                rssi = newDevice.rssi ?: existing.rssi,
-                distanceMeters = newDevice.distanceMeters ?: existing.distanceMeters
-            )
+            val updated = if (forceUpdateDisconnected) {
+                newDevice.copy(
+                    isConnected = false,
+                    rssi = null,
+                    distanceMeters = null
+                )
+            } else {
+                newDevice.copy(
+                    isConnected = existing.isConnected || newDevice.isConnected,
+                    rssi = newDevice.rssi ?: existing.rssi,
+                    distanceMeters = newDevice.distanceMeters ?: existing.distanceMeters
+                )
+            }
             current[existingIndex] = updated
         } else {
             current.add(newDevice)
@@ -424,10 +513,17 @@ class BleScannerManager(private val context: Context) {
         pollingJob?.cancel()
         pollingJob = coroutineScope.launch {
             while (_isScanning.value) {
-                delay(2000L)
+                delay(periodicPollingIntervalMs())
                 fetchConnectedDevices()
             }
         }
+    }
+
+    private fun periodicPollingIntervalMs(): Long = when (proximityState) {
+        ProximityState.AT_LIMIT, ProximityState.LINK_RISK, ProximityState.IMMINENT -> 1000L
+        ProximityState.MOVING_AWAY -> 3000L
+        ProximityState.SAFE -> 5000L
+        else -> 5000L
     }
 
     @SuppressLint("MissingPermission")
@@ -447,13 +543,11 @@ class BleScannerManager(private val context: Context) {
                 val existing = _scanResults.value.find { it.address == address }
 
                 if (existing == null) {
-                    val defaultRssi = -45
-                    val defaultDistance = DistanceEstimator.estimateDistance(defaultRssi)
                     val bleDevice = BleDevice(
                         address = address,
                         name = name,
-                        rssi = defaultRssi,
-                        distanceMeters = defaultDistance,
+                        rssi = null,
+                        distanceMeters = null,
                         lastSeen = System.currentTimeMillis(),
                         isConnected = true
                     )
@@ -474,11 +568,24 @@ class BleScannerManager(private val context: Context) {
     @SuppressLint("MissingPermission")
     private fun isDeviceConnected(address: String): Boolean {
         return try {
-            val isA2dpConnected = bluetoothAdapter?.getProfileConnectionState(BluetoothProfile.A2DP) == BluetoothAdapter.STATE_CONNECTED
-            val isHeadsetConnected = bluetoothAdapter?.getProfileConnectionState(BluetoothProfile.HEADSET) == BluetoothAdapter.STATE_CONNECTED
-            val isGattConnected = bluetoothManager?.getConnectedDevices(BluetoothProfile.GATT)
-                ?.any { it.address == address } == true
-            isA2dpConnected || isHeadsetConnected || isGattConnected
+            // Check the SPECIFIC selected device, not any A2DP/Headset profile.
+            val gattConnected = bluetoothManager?.getConnectedDevices(BluetoothProfile.GATT)
+                ?.any { it.address.equals(address, ignoreCase = true) } == true
+            if (gattConnected) return true
+
+            val device = bluetoothAdapter?.getRemoteDevice(address) ?: return false
+            // device.isConnected (no-arg) is not part of the public SDK; connectivity
+            // is already covered by the GATT connected-devices check above and the
+            // profile checks below.
+
+            // Fall back to profile proxies: only count if THIS device is in the connected list.
+            val a2dpConnected = try {
+                // We don't hold an A2DP proxy here; treat global A2DP state as connected only
+                // if the device is bonded and currently reported as an audio output sink.
+                bluetoothAdapter?.getProfileConnectionState(BluetoothProfile.A2DP) == BluetoothAdapter.STATE_CONNECTED &&
+                    bluetoothAdapter.bondedDevices?.any { it.address.equals(address, ignoreCase = true) } == true
+            } catch (e: Exception) { false }
+            a2dpConnected
         } catch (e: Exception) {
             false
         }
@@ -522,7 +629,26 @@ class BleScannerManager(private val context: Context) {
         }
     }
 
+    fun isBluetoothEnabled(): Boolean = bluetoothAdapter?.isEnabled == true
+
+    fun isDeviceConnected(): Boolean {
+        val addr = selectedAddress ?: return false
+        return isDeviceConnected(addr)
+    }
+
+    fun setProximityState(state: ProximityState) {
+        proximityState = state
+    }
+
     companion object {
+        @Volatile
+        private var instance: BleScannerManager? = null
+
+        fun getInstance(context: Context): BleScannerManager =
+            instance ?: synchronized(this) {
+                instance ?: BleScannerManager(context.applicationContext).also { instance = it }
+            }
+
         const val TAG = "BleScannerManager"
     }
 }

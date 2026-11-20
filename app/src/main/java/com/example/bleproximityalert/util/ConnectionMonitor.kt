@@ -25,7 +25,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
-class ConnectionMonitor(private val context: Context) {
+class ConnectionMonitor private constructor(private val context: Context) {
     private val bluetoothManager = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
     private val bluetoothAdapter = bluetoothManager?.adapter
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
@@ -43,6 +43,7 @@ class ConnectionMonitor(private val context: Context) {
     private val coroutineScope = CoroutineScope(Dispatchers.Main)
     private var pollJob: Job? = null
     private val disconnectGraceJobs = mutableMapOf<String, Job>()
+    private var profileEventsReceived = false
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context?, intent: Intent?) {
@@ -60,6 +61,7 @@ class ConnectionMonitor(private val context: Context) {
                 }
                 BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED,
                 BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED -> {
+                    profileEventsReceived = true
                     val state = intent.getIntExtra(BluetoothProfile.EXTRA_STATE, BluetoothProfile.STATE_DISCONNECTED)
                     if (state == BluetoothProfile.STATE_CONNECTED) {
                         device?.let { cancelGracePeriod(it.address) }
@@ -221,6 +223,10 @@ class ConnectionMonitor(private val context: Context) {
         }
     }
 
+    fun clearDisconnectEvent() {
+        _onDeviceDisconnected.value = null
+    }
+
     private fun scheduleDisconnectGracePeriod(device: BluetoothDevice) {
         val address = device.address
         cancelGracePeriod(address)
@@ -242,11 +248,13 @@ class ConnectionMonitor(private val context: Context) {
         pollJob?.cancel()
         pollJob = coroutineScope.launch {
             while (true) {
-                delay(10000L) // 10-second fallback poll
+                delay(fallbackPollIntervalMs())
                 refreshConnectedDevices()
             }
         }
     }
+
+    private fun fallbackPollIntervalMs(): Long = if (profileEventsReceived) 30000L else 10000L
 
     private fun registerReceiver() {
         if (isReceiverRegistered) return
@@ -290,6 +298,14 @@ class ConnectionMonitor(private val context: Context) {
     }
 
     companion object {
+        @Volatile
+        private var instance: ConnectionMonitor? = null
+
+        fun getInstance(context: Context): ConnectionMonitor =
+            instance ?: synchronized(this) {
+                instance ?: ConnectionMonitor(context.applicationContext).also { instance = it }
+            }
+
         const val TAG = "ConnectionMonitor"
     }
 }

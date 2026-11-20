@@ -17,6 +17,12 @@ enum class ConfidenceLevel {
     NONE
 }
 
+enum class RssiProbeState {
+    Probing,
+    Available,
+    Unavailable
+}
+
 data class BleDevice(
     val address: String,
     val name: String,

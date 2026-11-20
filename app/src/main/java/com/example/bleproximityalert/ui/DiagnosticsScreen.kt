@@ -89,10 +89,13 @@ fun DiagnosticsScreen(
                     Column(modifier = Modifier.padding(16.dp)) {
                         Text("Live Metrics", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                         Spacer(modifier = Modifier.height(8.dp))
-                        Text("Raw/Filtered RSSI: ${selectedDevice?.rssi ?: "N/A"} dBm")
-                        Text("Estimated Distance: ${selectedDevice?.distanceMeters ?: "N/A"} m")
+                        Text("Raw/Filtered RSSI: ${selectedDevice?.rssi?.let { "$it dBm" } ?: "—"}")
+                        Text("Estimated Distance: ${selectedDevice?.distanceMeters?.let { String.format("%.1f m", it) } ?: "—"}")
                         Text("Proximity State: ${selectedDevice?.state ?: "N/A"}")
                         Text("Trend Slope: ${selectedDevice?.trendSlopeDbmPerSec?.let { String.format("%.2f dBm/s", it) } ?: "N/A"}")
+Text("Signal Source: ${selectedDevice?.rssiSourceLabel ?: "—"}")
+Text("Confidence: ${selectedDevice?.confidence?.name ?: "—"}")
+Text("Range: ${if (selectedDevice?.minDistanceMeters != null && selectedDevice?.maxDistanceMeters != null) "${String.format("%.1f", selectedDevice!!.minDistanceMeters)} – ${String.format("%.1f", selectedDevice!!.maxDistanceMeters)} m" else "—"}")
                     }
                 }
             }
@@ -106,7 +109,7 @@ fun DiagnosticsScreen(
                         Text("Test In-Ear Voice Alert")
                     }
                     OutlinedButton(
-                        onClick = { selectedDevice?.let { viewModel.selectBleDevice(it) } },
+                        onClick = { selectedDevice?.let { viewModel.selectDevice(it.address, it.name, it.isCurrentAudioOutput) } },
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         Text("Re-Run Capability Probe")
