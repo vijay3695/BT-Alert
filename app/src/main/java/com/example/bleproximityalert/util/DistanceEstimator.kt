@@ -24,6 +24,14 @@ object DistanceEstimator {
         return (clamped * 10.0).roundToInt() / 10.0
     }
 
+    fun estimateDistance(
+        rssi: Double?,
+        calibration: CalibrationModel = CalibrationModel(deviceAddress = "")
+    ): Double? {
+        if (rssi == null || rssi == 0.0 || rssi <= -100.0) return null
+        return estimateDistance(rssi.toInt(), calibration)
+    }
+
     fun estimateRange(
         filteredRssi: Double?,
         variance: Double,

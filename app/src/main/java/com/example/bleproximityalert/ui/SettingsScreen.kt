@@ -17,14 +17,17 @@ import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -93,59 +96,35 @@ fun SettingsScreen(
             items(distances) { distance ->
                 val isSelected = thresholdConfig.warningDistanceMeters == distance
                 val isCritical = distance <= 0.5
+                val labelText = if (distance >= 1.0) "${distance.toInt()} meters" else "$distance meters"
 
                 Card(
                     onClick = { viewModel.updateThreshold(distance) },
                     modifier = Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(
-                        containerColor = if (isSelected) {
-                            MaterialTheme.colorScheme.primaryContainer
-                        } else {
-                            MaterialTheme.colorScheme.surfaceVariant
-                        }
+                        containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
                     )
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(16.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
-                    ) {
-                        Column {
-                            val labelText = if (distance >= 1.0) "${distance.toInt()} meters" else "$distance meters"
+                    ListItem(
+                        headlineContent = {
                             Text(
                                 text = labelText,
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal,
-                                color = if (isSelected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface
+                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
                             )
-                            if (isCritical) {
+                        },
+                        supportingContent = if (isCritical) {
+                            {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(
-                                        imageVector = Icons.Default.Warning,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.error,
-                                        modifier = Modifier.height(14.dp)
-                                    )
-                                    Text(
-                                        text = " Critical zone - warn before disconnect",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.error,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
+                                    Icon(Icons.Default.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.height(14.dp))
+                                    Text(" Critical zone — warn before disconnect", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.SemiBold)
                                 }
                             }
-                        }
-
-                        if (isSelected) {
-                            Icon(
-                                imageVector = Icons.Default.Check,
-                                contentDescription = "Selected",
-                                tint = MaterialTheme.colorScheme.primary
-                            )
-                        }
-                    }
+                        } else null,
+                        leadingContent = {
+                            RadioButton(selected = isSelected, onClick = { viewModel.updateThreshold(distance) })
+                        },
+                        colors = androidx.compose.material3.ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent)
+                    )
                 }
             }
 
@@ -155,6 +134,15 @@ fun SettingsScreen(
                     modifier = Modifier.fillMaxWidth(),
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
+                    OutlinedButton(
+                        onClick = { viewModel.testTtsVoice() },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.VolumeUp, contentDescription = null)
+                        Spacer(modifier = Modifier.padding(start = 6.dp))
+                        Text("Test Voice Alert")
+                    }
+
                     OutlinedButton(
                         onClick = onOpenCalibration,
                         modifier = Modifier.fillMaxWidth()

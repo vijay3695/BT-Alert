@@ -46,6 +46,8 @@ class KalmanFilter(
         return newEst
     }
 
+    fun sampleCount(): Int = filteredHistory.size
+
     fun computeVariance(): Double {
         if (filteredHistory.size < 3) return 4.0
         val mean = filteredHistory.average()

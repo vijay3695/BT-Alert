@@ -6,14 +6,19 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -39,6 +44,8 @@ fun StartMonitoringScreen(
     onOpenSettings: () -> Unit
 ) {
     val thresholdConfig by viewModel.thresholdConfig.collectAsState()
+    val isStarting by viewModel.isStarting.collectAsState()
+    val startError by viewModel.startError.collectAsState()
 
     val formattedThreshold = if (thresholdConfig.warningDistanceMeters >= 1.0) {
         "${thresholdConfig.warningDistanceMeters.toInt()}m"
@@ -49,10 +56,10 @@ fun StartMonitoringScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
+            .verticalScroll(rememberScrollState())
             .padding(24.dp)
             .systemBarsPadding(),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.SpaceBetween
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -113,19 +120,44 @@ fun StartMonitoringScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
             Text(
-                text = "When monitoring is active, the app continuously evaluates signal trends and speaks a voice alert inside your Bluetooth earphones if you start walking away from your phone.",
+                text = if (isStarting) {
+                    "Starting monitoring — checking your headset's signal. This can take a few seconds."
+                } else {
+                    "When monitoring is active, the app continuously evaluates signal trends and speaks a voice alert inside your Bluetooth earphones if you start walking away from your phone."
+                },
                 style = MaterialTheme.typography.bodyMedium,
                 textAlign = TextAlign.Center,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
 
+        if (startError != null) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = startError!!,
+                style = MaterialTheme.typography.bodyMedium,
+                textAlign = TextAlign.Center,
+                color = MaterialTheme.colorScheme.error
+            )
+        }
+
         Column(modifier = Modifier.fillMaxWidth()) {
             Button(
                 onClick = onStart,
+                enabled = !isStarting,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text(text = "Start Monitoring", style = MaterialTheme.typography.titleMedium)
+                if (isStarting) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        strokeWidth = 2.dp,
+                        color = MaterialTheme.colorScheme.onPrimary
+                    )
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Text(text = "Starting…", style = MaterialTheme.typography.titleMedium)
+                } else {
+                    Text(text = "Start Monitoring", style = MaterialTheme.typography.titleMedium)
+                }
             }
             Spacer(modifier = Modifier.height(8.dp))
             OutlinedButton(
