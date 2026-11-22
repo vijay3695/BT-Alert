@@ -58,18 +58,22 @@ class AlertEngine(val config: ThresholdConfig = ThresholdConfig()) {
         val slope = trendAnalyzer.calculateSlopeDbmPerSecond()
         val secondsToLoss = trendAnalyzer.predictSecondsToLoss(rssi.toDouble())
 
+        // Signal-trend alerts (LINK_RISK / IMMINENT) only matter when you're
+        // already in the warning zone. Otherwise moving the phone a short distance
+        // (e.g. 0.4 m -> 3 m with a 6 m threshold) triggers a false warning.
+        val inWarningZone = distanceMeters >= config.warningDistanceMeters * 0.6
         val rawTargetState = when {
-            rssi <= -85 || (secondsToLoss != null && secondsToLoss <= 7.0) || distanceMeters >= 9.0 -> {
+            rssi <= -85 || (inWarningZone && secondsToLoss != null && secondsToLoss <= 7.0) || distanceMeters >= 9.0 -> {
                 ProximityState.IMMINENT
             }
-            secondsToLoss != null && secondsToLoss <= 20.0 -> {
+            inWarningZone && secondsToLoss != null && secondsToLoss <= 20.0 -> {
                 ProximityState.LINK_RISK
             }
             distanceMeters >= config.warningDistanceMeters ||
                     (distanceMeters >= config.warningDistanceMeters * 0.85 && slope != null && slope < -1.0) -> {
                 ProximityState.AT_LIMIT
             }
-            slope != null && slope < -1.0 -> {
+            slope != null && slope < -1.0 && distanceMeters >= config.warningDistanceMeters * 0.7 -> {
                 ProximityState.MOVING_AWAY
             }
             else -> {

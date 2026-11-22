@@ -2,10 +2,14 @@ package com.example.bleproximityalert
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
@@ -71,6 +75,31 @@ class MainActivity : ComponentActivity() {
                 val deniedPermissions by viewModel.deniedPermissions.collectAsState()
 
                 var activeScreen by rememberSaveable { mutableStateOf(AppScreen.DEVICE_SELECTION) }
+                var showExitDialog by remember { mutableStateOf(false) }
+
+                if (showExitDialog) {
+                    AlertDialog(
+                        onDismissRequest = { showExitDialog = false },
+                        title = { Text("Exit app?") },
+                        text = { Text("Monitoring will continue in the background if active. Are you sure you want to exit?") },
+                        confirmButton = {
+                            TextButton(onClick = { finish() }) { Text("Exit") }
+                        },
+                        dismissButton = {
+                            TextButton(onClick = { showExitDialog = false }) { Text("Cancel") }
+                        }
+                    )
+                }
+
+                BackHandler(enabled = true) {
+                    when (activeScreen) {
+                        AppScreen.SETTINGS -> activeScreen = if (selectedDevice != null) AppScreen.START_MONITORING else AppScreen.DEVICE_SELECTION
+                        AppScreen.DIAGNOSTICS -> activeScreen = AppScreen.SETTINGS
+                        AppScreen.CALIBRATION -> activeScreen = AppScreen.SETTINGS
+                        AppScreen.DISCONNECT_HISTORY -> activeScreen = AppScreen.SETTINGS
+                        else -> showExitDialog = true
+                    }
+                }
 
                 when {
                     !hasPermissions -> {
@@ -93,7 +122,7 @@ class MainActivity : ComponentActivity() {
                             onBack = { activeScreen = if (selectedDevice != null) AppScreen.START_MONITORING else AppScreen.DEVICE_SELECTION },
                             onOpenDiagnostics = { activeScreen = AppScreen.DIAGNOSTICS },
                             onOpenCalibration = { activeScreen = AppScreen.CALIBRATION },
-                            onOpenHistory = { activeScreen = AppScreen.DISCONNECT_HISTORY }
+                            onOpenHistory = { activeScreen = AppScreen.DISCONNECT_HISTORY },
                         )
                     }
 

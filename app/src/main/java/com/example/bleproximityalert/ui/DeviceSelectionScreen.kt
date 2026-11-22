@@ -252,8 +252,10 @@ private fun DeviceCard(
     device: ConnectedAudioDevice,
     onSelect: () -> Unit
 ) {
+    val connected = device.supportsA2dp || device.supportsHeadset || device.isCurrentAudioOutput
     Card(
         onClick = onSelect,
+        enabled = connected,
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(
             containerColor = if (device.isCurrentAudioOutput) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
@@ -290,10 +292,10 @@ private fun DeviceCard(
             }
 
             Text(
-                text = if (device.isCurrentAudioOutput) "Active Output" else "Connected",
+                text = if (!connected) "Paired" else if (device.isCurrentAudioOutput) "Active Output" else "Connected",
                 style = MaterialTheme.typography.labelMedium,
                 fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.primary
+                color = if (connected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
     }

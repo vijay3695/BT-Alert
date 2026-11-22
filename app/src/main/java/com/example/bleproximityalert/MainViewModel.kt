@@ -27,6 +27,7 @@ import com.example.bleproximityalert.util.DisconnectRecorder
 import com.example.bleproximityalert.util.PermissionHelper
 import com.example.bleproximityalert.util.TextToSpeechHelper
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -38,7 +39,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val connectionMonitor = ConnectionMonitor.getInstance(application)
     private val disconnectRecorder = DisconnectRecorder(application)
     private val calibrationStorage = CalibrationStorage(application)
-    private val capabilityProbe = RssiCapabilityProbe(application)
+    private val capabilityProbe = RssiCapabilityProbe(application, scanner)
 
     private var alertEngine = AlertEngine(loadThresholdConfig())
 
@@ -65,6 +66,21 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _thresholdConfig = MutableStateFlow(alertEngine.config)
     val thresholdConfig: StateFlow<ThresholdConfig> = _thresholdConfig.asStateFlow()
 
+    private val _voiceEnabled = MutableStateFlow(true)
+    val voiceEnabled: StateFlow<Boolean> = _voiceEnabled.asStateFlow()
+    private val _voiceSpeed = MutableStateFlow(0.9f)
+    val voiceSpeed: StateFlow<Float> = _voiceSpeed.asStateFlow()
+    private val _voiceCooldownSeconds = MutableStateFlow(30)
+    val voiceCooldownSeconds: StateFlow<Int> = _voiceCooldownSeconds.asStateFlow()
+    private val _powerMode = MutableStateFlow("Balanced")
+    val powerMode: StateFlow<String> = _powerMode.asStateFlow()
+    private val _backgroundLocationEnabled = MutableStateFlow(false)
+    val backgroundLocationEnabled: StateFlow<Boolean> = _backgroundLocationEnabled.asStateFlow()
+    private val _autoMonitorOnConnect = MutableStateFlow(false)
+    val autoMonitorOnConnect: StateFlow<Boolean> = _autoMonitorOnConnect.asStateFlow()
+    private val _sensitivity = MutableStateFlow(2)
+    val sensitivity: StateFlow<Int> = _sensitivity.asStateFlow()
+
     private val _isRssiAvailable = MutableStateFlow(true)
     val isRssiAvailable: StateFlow<Boolean> = _isRssiAvailable.asStateFlow()
 
@@ -86,12 +102,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var scanJob: Job? = null
     private var disconnectObserverJob: Job? = null
     private var probeJob: Job? = null
+    private var probeAddress: String? = null
 
     init {
         checkPermissions()
         startObservingScanResults()
         startObservingDisconnections()
         refreshDisconnectHistory()
+        loadSettings()
+        // Start auto-monitor service if enabled.
+        if (_autoMonitorOnConnect.value) {
+            try {
+                val intent = Intent(getApplication(), BleForegroundService::class.java).apply {
+                    action = BleForegroundService.ACTION_LISTEN
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    getApplication<Application>().startForegroundService(intent)
+                } else {
+                    getApplication<Application>().startService(intent)
+                }
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "Failed to start auto-monitor service", e)
+            }
+        }
     }
 
     fun checkPermissions() {
@@ -131,7 +164,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _rssiProbeState.value = RssiProbeState.Probing
         _rssiProbeDetails.value = "Probing RSSI capability..."
 
-        // Run capability probe to detect if headset exposes live RSSI
+        // Run capability probe to detect if headset exposes live RSSI. A repeated
+        // selection of the same device must not cancel and restart an in-flight
+        // probe: that tore down its receivers and left the UI stuck on "Probing".
+        if (probeAddress?.equals(address, ignoreCase = true) == true && probeJob?.isActive == true) return
+        probeAddress = address
         probeJob?.cancel()
         probeJob = viewModelScope.launch {
             val result = capabilityProbe.probeDeviceCapabilities(address, name)
@@ -141,6 +178,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val label = when (result.sourceType) {
                 RssiSourceType.GATT_RSSI -> "GATT RSSI"
                 RssiSourceType.BLE_SCAN_RSSI -> "BLE scan RSSI"
+                RssiSourceType.CLASSIC_INQUIRY_RSSI -> "Classic inquiry RSSI"
                 RssiSourceType.UNAVAILABLE -> "Unavailable"
             }
             _selectedDevice.value = _selectedDevice.value?.copy(rssiSourceLabel = label)
@@ -181,11 +219,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _startError.value = null
         _isStarting.value = true
 
-        // Await the capability probe launched during selection before scanning,
-        // so _isRssiAvailable reflects the real probe result on first evaluation.
+        // Do not block monitoring on the capability probe: it can take up to ~15s on
+        // a classic-only headset and made "Start" look dead. Start scanning now; the
+        // probe updates the source label and availability when it finishes.
         viewModelScope.launch {
             try {
-                probeJob?.join()
                 scanner.selectDevice(device.address, device.name)
                 scanner.startScan()
                 _isMonitoring.value = true
@@ -231,6 +269,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val label = when (result.sourceType) {
                     RssiSourceType.GATT_RSSI -> "GATT RSSI"
                     RssiSourceType.BLE_SCAN_RSSI -> "BLE scan RSSI"
+                    RssiSourceType.CLASSIC_INQUIRY_RSSI -> "Classic inquiry RSSI"
                     RssiSourceType.UNAVAILABLE -> "Unavailable"
                 }
                 _selectedDevice.value = _selectedDevice.value?.copy(rssiSourceLabel = label)
@@ -240,6 +279,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 _rssiProbeState.value = RssiProbeState.Unavailable
                 _rssiProbeDetails.value = "Signal check failed: ${e.message ?: "unknown error"}"
             }
+        }
+    }
+
+    fun runManualDiscovery() {
+        viewModelScope.launch {
+            scanner.startScan(false)
+            delay(10_000L)
+            scanner.stopScan()
         }
     }
 
@@ -273,6 +320,44 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         calibrationStorage.saveCalibration(calibration)
     }
 
+    fun isDeviceCalibrated(address: String): Boolean {
+        return calibrationStorage.getCalibration(address)?.calibrated == true
+    }
+
+    fun setAutoMonitorOnConnect(enabled: Boolean) {
+        _autoMonitorOnConnect.value = enabled
+        val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefs.edit { putBoolean(KEY_AUTO_MONITOR, enabled) }
+        // Start or stop the foreground service based on the toggle.
+        if (enabled) {
+            // Start service in listening mode (no active scan until device connects).
+            try {
+                val intent = Intent(getApplication(), BleForegroundService::class.java).apply {
+                    action = BleForegroundService.ACTION_LISTEN
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    getApplication<Application>().startForegroundService(intent)
+                } else {
+                    getApplication<Application>().startService(intent)
+                }
+            } catch (e: Exception) {
+                Log.e("MainViewModel", "Failed to start auto-monitor service", e)
+            }
+        } else {
+            // Stop the service if not actively monitoring.
+            if (!_isMonitoring.value) {
+                try {
+                    val intent = Intent(getApplication(), BleForegroundService::class.java).apply {
+                        action = BleForegroundService.ACTION_STOP
+                    }
+                    getApplication<Application>().startService(intent)
+                } catch (e: Exception) {
+                    Log.e("MainViewModel", "Failed to stop auto-monitor service", e)
+                }
+            }
+        }
+    }
+
     fun refreshDisconnectHistory() {
         _disconnectHistory.value = disconnectRecorder.getEvents()
     }
@@ -282,12 +367,41 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         refreshDisconnectHistory()
     }
 
+    fun deleteDisconnectEvent(event: com.example.bleproximityalert.model.DisconnectEvent) {
+        disconnectRecorder.deleteEvent(event.timestampMs)
+        refreshDisconnectHistory()
+    }
+
     private fun startObservingScanResults() {
         scanJob?.cancel()
         scanJob = viewModelScope.launch {
             scanner.scanResults.collect { results ->
                 evaluateSelectedDevice(results)
+                promoteRssiAvailability(results)
             }
+        }
+    }
+
+    /**
+     * The probe only samples for a few seconds. If a live RSSI reading arrives later
+     * from any source (BLE advertisement, GATT, or classic inquiry), the UI must follow
+     * the data instead of staying stuck on the first probe result.
+     */
+    private fun promoteRssiAvailability(results: List<BleDevice>) {
+        val address = _selectedDevice.value?.address ?: return
+        val now = System.currentTimeMillis()
+        val live = results.firstOrNull {
+            it.address.equals(address, ignoreCase = true) &&
+                it.rssi != null &&
+                it.isConnected &&
+                now - it.lastSeen <= RSSI_FRESHNESS_MS
+        } ?: return
+
+        if (!_isRssiAvailable.value) {
+            Log.d("MainViewModel", "Live RSSI arrived for $address (${live.rssi} dBm), marking signal available")
+            _isRssiAvailable.value = true
+            _rssiProbeState.value = RssiProbeState.Available
+            _rssiProbeDetails.value = "Live signal readings are arriving."
         }
     }
 
@@ -377,6 +491,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun setVoiceEnabled(v: Boolean) {
+        _voiceEnabled.value = v
+        getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit { putBoolean(KEY_VOICE_ENABLED, v) }
+    }
+    fun setVoiceSpeed(v: Float) {
+        _voiceSpeed.value = v
+        getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit { putFloat(KEY_VOICE_SPEED, v) }
+    }
+    fun setVoiceCooldownSeconds(v: Int) {
+        _voiceCooldownSeconds.value = v
+        getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit { putInt(KEY_VOICE_COOLDOWN, v) }
+    }
+    fun setPowerMode(v: String) {
+        _powerMode.value = v
+        getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit { putString(KEY_POWER_MODE, v) }
+    }
+    fun setBackgroundLocationEnabled(v: Boolean) {
+        _backgroundLocationEnabled.value = v
+        getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit { putBoolean(KEY_BG_LOCATION, v) }
+    }
+    fun setSensitivity(v: Int) {
+        _sensitivity.value = v
+        getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit { putInt(KEY_SENSITIVITY, v) }
+    }
+
+    private fun loadSettings() {
+        val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        _voiceEnabled.value = prefs.getBoolean(KEY_VOICE_ENABLED, true)
+        _voiceSpeed.value = prefs.getFloat(KEY_VOICE_SPEED, 0.9f)
+        _voiceCooldownSeconds.value = prefs.getInt(KEY_VOICE_COOLDOWN, 30)
+        _powerMode.value = prefs.getString(KEY_POWER_MODE, "Balanced") ?: "Balanced"
+        _backgroundLocationEnabled.value = prefs.getBoolean(KEY_BG_LOCATION, false)
+        _autoMonitorOnConnect.value = prefs.getBoolean(KEY_AUTO_MONITOR, false)
+        _sensitivity.value = prefs.getInt(KEY_SENSITIVITY, 2)
+    }
+
     private fun loadThresholdConfig(): ThresholdConfig {
         val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val saved = prefs.getFloat(KEY_WARNING_DISTANCE, 2.0f)
@@ -420,5 +570,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         const val KEY_WARNING_DISTANCE = "warning_distance_meters"
         const val KEY_SELECTED_ADDRESS = "selected_device_address"
         const val KEY_SELECTED_NAME = "selected_device_name"
+        const val KEY_VOICE_ENABLED = "voice_enabled"
+        const val KEY_VOICE_SPEED = "voice_speed"
+        const val KEY_VOICE_COOLDOWN = "voice_cooldown_seconds"
+        const val KEY_POWER_MODE = "power_mode"
+        const val KEY_BG_LOCATION = "background_location_enabled"
+    const val KEY_AUTO_MONITOR = "auto_monitor_on_connect"
+        const val KEY_SENSITIVITY = "sensitivity"
+        private const val RSSI_FRESHNESS_MS = 10_000L
     }
 }

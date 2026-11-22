@@ -1,7 +1,11 @@
 package com.example.bleproximityalert.ui
 
+import android.Manifest
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.provider.Settings
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -15,6 +19,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.systemBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.LocationOn
 import androidx.compose.material.icons.filled.Notifications
@@ -33,6 +39,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 
 @Composable
 fun PermissionRequestScreen(
@@ -41,6 +48,9 @@ fun PermissionRequestScreen(
 ) {
     val context = LocalContext.current
     val permanentlyDenied = deniedPermissions.isNotEmpty()
+
+    fun granted(perm: String): Boolean =
+        ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
 
     Column(
         modifier = Modifier
@@ -54,10 +64,9 @@ fun PermissionRequestScreen(
             imageVector = Icons.Default.Info,
             contentDescription = null,
             tint = MaterialTheme.colorScheme.primary,
-            modifier = Modifier
-                .size(56.dp)
-                .padding(bottom = 16.dp)
+            modifier = Modifier.size(56.dp)
         )
+        Spacer(modifier = Modifier.height(8.dp))
         Text(
             text = "Permissions Required",
             style = MaterialTheme.typography.headlineMedium,
@@ -74,11 +83,21 @@ fun PermissionRequestScreen(
         Spacer(modifier = Modifier.height(16.dp))
 
         val items = listOf(
-            Triple(Icons.Default.Info, "Bluetooth scan & connect", "Find your connected earphones and read their signal."),
-            Triple(Icons.Default.LocationOn, "Location", "Android requires this to scan Bluetooth devices."),
-            Triple(Icons.Default.Notifications, "Notifications", "Show the monitoring status while running in the background.")
+            Triple(Icons.Default.Info, "Bluetooth scan & connect", "Find your connected earphones and read their signal.") to listOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT
+            ),
+            Triple(Icons.Default.Notifications, "Notifications", "Show the monitoring status while running in the background.") to listOf(
+                Manifest.permission.POST_NOTIFICATIONS
+            ),
+            Triple(Icons.Default.LocationOn, "Location (while in use)", "Android requires this to scan Bluetooth devices.") to listOf(
+                Manifest.permission.ACCESS_FINE_LOCATION
+            )
         )
-        items.forEach { (icon, title, body) ->
+
+        items.forEach { (meta, perms) ->
+            val (icon, title, body) = meta
+            val allGranted = perms.all { granted(it) || Build.VERSION.SDK_INT < Build.VERSION_CODES.S && it.startsWith("android.permission.BLUETOOTH") }
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -89,11 +108,27 @@ fun PermissionRequestScreen(
                     modifier = Modifier.padding(12.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(icon, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    Icon(
+                        imageVector = if (allGranted) Icons.Default.Check else icon,
+                        contentDescription = null,
+                        tint = if (allGranted) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                     Spacer(modifier = Modifier.width(12.dp))
                     Column(modifier = Modifier.weight(1f)) {
                         Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
                         Text(body, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (perms.any { !granted(it) && !(Build.VERSION.SDK_INT < Build.VERSION_CODES.S && it.startsWith("android.permission.BLUETOOTH")) }) {
+                            Text(
+                                "Denied: ${perms.filter { !granted(it) }.joinToString()}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+                    }
+                    if (allGranted) {
+                        Icon(Icons.Default.Check, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    } else {
+                        Icon(Icons.Default.Close, contentDescription = null, tint = MaterialTheme.colorScheme.error)
                     }
                 }
             }

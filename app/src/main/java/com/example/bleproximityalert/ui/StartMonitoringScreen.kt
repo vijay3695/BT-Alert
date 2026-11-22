@@ -121,7 +121,7 @@ fun StartMonitoringScreen(
             Spacer(modifier = Modifier.height(16.dp))
             Text(
                 text = if (isStarting) {
-                    "Starting monitoring — checking your headset's signal. This can take a few seconds."
+                    "Starting monitoring. Checking your headset's signal. This can take a few seconds."
                 } else {
                     "When monitoring is active, the app continuously evaluates signal trends and speaks a voice alert inside your Bluetooth earphones if you start walking away from your phone."
                 },

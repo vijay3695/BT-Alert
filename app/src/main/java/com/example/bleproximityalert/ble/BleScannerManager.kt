@@ -20,6 +20,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.example.bleproximityalert.model.ProximityState
 import com.example.bleproximityalert.model.BleDevice
 import com.example.bleproximityalert.model.CalibrationModel
@@ -35,6 +36,21 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+
+/**
+ * A dual-mode headset is paired under its classic BR/EDR name and address but may
+ * advertise over BLE with a different, sometimes randomised address and an "LE_"
+ * name prefix (e.g. Sony WF-C500 advertises as "LE_WF-C500"). Match either form so
+ * the live RSSI from that advertisement is not silently discarded.
+ */
+internal fun bleNamesMatch(a: String?, b: String?): Boolean {
+    if (a == null || b == null) return false
+    fun normalize(s: String): String {
+        val trimmed = s.trim()
+        return if (trimmed.startsWith("LE_", ignoreCase = true)) trimmed.substring(3) else trimmed
+    }
+    return normalize(a).equals(normalize(b), ignoreCase = true)
+}
 
 class BleScannerManager private constructor(private val context: Context) {
     private val bluetoothManager: BluetoothManager? =
@@ -134,6 +150,8 @@ class BleScannerManager private constructor(private val context: Context) {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             Log.d(TAG, "GATT state change for ${gatt.device.address}: status=$status, newState=$newState")
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                // Discover services first; some stacks reject readRemoteRssi until then.
+                try { gatt.discoverServices() } catch (e: Exception) {}
                 // Only start polling after GATT connection is established
                 startGattRssiPolling()
                 // Also try reading RSSI immediately
@@ -232,12 +250,18 @@ class BleScannerManager private constructor(private val context: Context) {
     private fun buildScanFilters(): List<ScanFilter>? {
         val filters = mutableListOf<ScanFilter>()
         try {
+            // A dual-mode headset is listed by its classic BR/EDR address but may
+            // advertise over LE under a different (sometimes randomised) address.
+            // Scan filters are OR-ed, so include the device name as well: without
+            // it a connected headset is invisible to the LE scan even though it is
+            // advertising right next to the phone.
             selectedAddress?.let { addr ->
                 filters.add(ScanFilter.Builder().setDeviceAddress(addr).build())
             }
-            if (filters.isEmpty()) {
-                selectedName?.let { name ->
-                    filters.add(ScanFilter.Builder().setDeviceName(name).build())
+            selectedName?.let { name ->
+                filters.add(ScanFilter.Builder().setDeviceName(name).build())
+                if (!name.startsWith("LE_", ignoreCase = true)) {
+                    filters.add(ScanFilter.Builder().setDeviceName("LE_$name").build())
                 }
             }
         } catch (e: Exception) {
@@ -277,11 +301,34 @@ class BleScannerManager private constructor(private val context: Context) {
         kalmanFilters.clear()
     }
 
+    /**
+     * True when no RSSI reading has arrived for the selected device within
+     * [thresholdMs]. Used by the foreground service to decide whether to
+     * re-run classic inquiry (the headset may have resumed advertising).
+     */
+    fun isRssiStale(thresholdMs: Long = 45_000L): Boolean {
+        val selected = selectedAddress ?: return true
+        val lastSeen = _scanResults.value.firstOrNull {
+            it.address.equals(selected, ignoreCase = true)
+        }?.lastSeen ?: return true
+        return System.currentTimeMillis() - lastSeen > thresholdMs
+    }
+
+    /**
+     * Re-runs the bounded classic-inquiry window. Safe to call while a BLE scan
+     * is active: startClassicDiscoveryLoop cancels any previous loop and stops
+     * early once the BLE scan provides a live reading.
+     */
+    fun restartClassicInquiry() {
+        if (classicDiscoveryActive) return
+        startClassicDiscoveryLoop(activeMonitoring = true)
+    }
+
     private fun isTargetDevice(address: String?, name: String?): Boolean {
         if (selectedAddress != null && address?.equals(selectedAddress, ignoreCase = true) == true) {
             return true
         }
-        if (selectedName != null && name != null && name.contains(selectedName!!, ignoreCase = true)) {
+        if (bleNamesMatch(name, selectedName)) {
             return true
         }
         return false
@@ -335,8 +382,12 @@ class BleScannerManager private constructor(private val context: Context) {
             Log.d(TAG, "Connecting GATT to $address...")
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                activeGattBredr = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_BREDR)
-                activeGattLe = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+                // Open a single GATT connection. Opening BR/EDR and LE at the same time
+                // for a dual-mode headset (e.g. Sony WF-C500) made both transports fight
+                // for the same callback and frequently left neither connected. Let Android
+                // pick the transport; the probe already established which path works.
+                activeGattBredr = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_AUTO)
+                activeGattLe = null
             } else {
                 activeGattBredr = device.connectGatt(context, false, gattCallback)
             }
@@ -603,7 +654,14 @@ class BleScannerManager private constructor(private val context: Context) {
                 addAction(BluetoothA2dp.ACTION_CONNECTION_STATE_CHANGED)
                 addAction(BluetoothHeadset.ACTION_CONNECTION_STATE_CHANGED)
             }
-            context.registerReceiver(bluetoothReceiver, filter)
+            // Bluetooth broadcasts come from a highly privileged app, not the system
+            // UID. Only RECEIVER_EXPORTED receives them on Android 13+.
+            ContextCompat.registerReceiver(
+                context,
+                bluetoothReceiver,
+                filter,
+                ContextCompat.RECEIVER_EXPORTED
+            )
             isReceiverRegistered = true
         } catch (e: Exception) {
             Log.e(TAG, "Failed to register broadcast receiver", e)

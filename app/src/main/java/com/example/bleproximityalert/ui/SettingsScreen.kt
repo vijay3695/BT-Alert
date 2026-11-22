@@ -13,21 +13,20 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
-import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.VolumeUp
-import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.RadioButton
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -48,9 +47,16 @@ fun SettingsScreen(
     onBack: () -> Unit,
     onOpenDiagnostics: () -> Unit,
     onOpenCalibration: () -> Unit,
-    onOpenHistory: () -> Unit
+    onOpenHistory: () -> Unit,
 ) {
     val thresholdConfig by viewModel.thresholdConfig.collectAsState()
+    val voiceEnabled by viewModel.voiceEnabled.collectAsState()
+    val voiceSpeed by viewModel.voiceSpeed.collectAsState()
+    val voiceCooldown by viewModel.voiceCooldownSeconds.collectAsState()
+    val powerMode by viewModel.powerMode.collectAsState()
+    val bgLocation by viewModel.backgroundLocationEnabled.collectAsState()
+    val sensitivity by viewModel.sensitivity.collectAsState()
+    val autoMonitor by viewModel.autoMonitorOnConnect.collectAsState()
     val distances = listOf(9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0, 0.5, 0.1)
 
     Column(
@@ -59,7 +65,7 @@ fun SettingsScreen(
             .systemBarsPadding()
     ) {
         TopAppBar(
-            title = { Text("Alert Settings") },
+            title = { Text("Settings") },
             navigationIcon = {
                 IconButton(onClick = onBack) {
                     Icon(Icons.Default.ArrowBack, contentDescription = "Back")
@@ -79,25 +85,17 @@ fun SettingsScreen(
         ) {
             item {
                 Text(
-                    text = "Configure Warning Distance Threshold",
+                    text = "Warning Distance Threshold",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
                     textAlign = TextAlign.Center
                 )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = "Select distance limit at which in-ear voice alerts will trigger",
-                    style = MaterialTheme.typography.bodySmall,
-                    textAlign = TextAlign.Center,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
             }
 
-            items(distances) { distance ->
+            items(distances.size) { idx ->
+                val distance = distances[idx]
                 val isSelected = thresholdConfig.warningDistanceMeters == distance
-                val isCritical = distance <= 0.5
                 val labelText = if (distance >= 1.0) "${distance.toInt()} meters" else "$distance meters"
-
                 Card(
                     onClick = { viewModel.updateThreshold(distance) },
                     modifier = Modifier.fillMaxWidth(),
@@ -105,66 +103,106 @@ fun SettingsScreen(
                         containerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant
                     )
                 ) {
-                    ListItem(
-                        headlineContent = {
-                            Text(
-                                text = labelText,
-                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
-                            )
-                        },
-                        supportingContent = if (isCritical) {
-                            {
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(Icons.Default.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.height(14.dp))
-                                    Text(" Critical zone — warn before disconnect", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.SemiBold)
-                                }
-                            }
-                        } else null,
-                        leadingContent = {
-                            RadioButton(selected = isSelected, onClick = { viewModel.updateThreshold(distance) })
-                        },
-                        colors = androidx.compose.material3.ListItemDefaults.colors(containerColor = androidx.compose.ui.graphics.Color.Transparent)
-                    )
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        RadioButton(selected = isSelected, onClick = { viewModel.updateThreshold(distance) })
+                        Spacer(modifier = Modifier.height(0.dp).weight(1f))
+                        Text(labelText, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal)
+                    }
                 }
             }
 
             item {
-                Spacer(modifier = Modifier.height(12.dp))
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    OutlinedButton(
-                        onClick = { viewModel.testTtsVoice() },
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(Icons.Default.VolumeUp, contentDescription = null)
-                        Spacer(modifier = Modifier.padding(start = 6.dp))
-                        Text("Test Voice Alert")
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("Auto-monitor", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("Auto-monitor on connect", fontWeight = FontWeight.Medium)
+                                Text(
+                                    "Start monitoring automatically when your selected headset connects.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Switch(checked = autoMonitor, onCheckedChange = { viewModel.setAutoMonitorOnConnect(it) })
+                        }
                     }
+                }
+            }
 
-                    OutlinedButton(
-                        onClick = onOpenCalibration,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
+            item {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("Voice", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Voice alerts enabled", modifier = Modifier.weight(1f))
+                            Switch(checked = voiceEnabled, onCheckedChange = { viewModel.setVoiceEnabled(it) })
+                        }
+                        Text("Speed: ${String.format("%.1f", voiceSpeed)}")
+                        Slider(value = voiceSpeed, onValueChange = { viewModel.setVoiceSpeed(it) }, valueRange = 0.5f..1.5f)
+                        Text("Cooldown: ${voiceCooldown}s")
+                        Slider(value = voiceCooldown.toFloat(), onValueChange = { viewModel.setVoiceCooldownSeconds(it.toInt()) }, valueRange = 10f..120f)
+                        OutlinedButton(onClick = { viewModel.testTtsVoice() }, modifier = Modifier.fillMaxWidth()) {
+                            Icon(Icons.Default.VolumeUp, contentDescription = null)
+                            Spacer(modifier = Modifier.padding(start = 6.dp))
+                            Text("Test Voice")
+                        }
+                    }
+                }
+            }
+
+            item {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("Power mode", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        listOf("Battery saver", "Balanced", "Responsive").forEach { mode ->
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                RadioButton(selected = powerMode == mode, onClick = { viewModel.setPowerMode(mode) })
+                                Text(mode)
+                            }
+                        }
+                    }
+                }
+            }
+
+            item {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("Location privacy", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("Save location on disconnect", modifier = Modifier.weight(1f))
+                            Switch(checked = bgLocation, onCheckedChange = { viewModel.setBackgroundLocationEnabled(it) })
+                        }
+                        Text("Location data is stored only on this phone; nothing is shared.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+
+            item {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Text("Sensitivity (debounce seconds): $sensitivity", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                        Slider(value = sensitivity.toFloat(), onValueChange = { viewModel.setSensitivity(it.toInt()) }, valueRange = 1f..10f)
+                    }
+                }
+            }
+
+            item {
+                Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = onOpenCalibration, modifier = Modifier.fillMaxWidth()) {
                         Icon(Icons.Default.Settings, contentDescription = null)
                         Spacer(modifier = Modifier.padding(start = 6.dp))
                         Text("Headset Distance Calibration Wizard")
                     }
-
-                    OutlinedButton(
-                        onClick = onOpenDiagnostics,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
+                    OutlinedButton(onClick = onOpenDiagnostics, modifier = Modifier.fillMaxWidth()) {
                         Icon(Icons.Default.Info, contentDescription = null)
                         Spacer(modifier = Modifier.padding(start = 6.dp))
                         Text("Headset Diagnostics & RSSI Probe")
                     }
-
-                    OutlinedButton(
-                        onClick = onOpenHistory,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
+                    OutlinedButton(onClick = onOpenHistory, modifier = Modifier.fillMaxWidth()) {
                         Icon(Icons.Default.Place, contentDescription = null)
                         Spacer(modifier = Modifier.padding(start = 6.dp))
                         Text("Disconnect History & Last Location")

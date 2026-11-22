@@ -190,6 +190,29 @@ class DisconnectRecorder(private val context: Context) {
         prefs.edit { remove(KEY_EVENTS) }
     }
 
+    fun deleteEvent(timestampMs: Long) {
+        val remaining = getEvents().filter { it.timestampMs != timestampMs }
+        if (remaining.isEmpty()) {
+            prefs.edit { remove(KEY_EVENTS) }
+            return
+        }
+        val jsonArray = JSONArray()
+        for (ev in remaining) {
+            val obj = JSONObject().apply {
+                put("timestampMs", ev.timestampMs)
+                put("deviceName", ev.deviceName)
+                put("deviceAddress", ev.deviceAddress)
+                put("lastRssi", ev.lastRssi ?: JSONObject.NULL)
+                put("lastDistanceMeters", ev.lastDistanceMeters ?: JSONObject.NULL)
+                put("latitude", ev.latitude ?: JSONObject.NULL)
+                put("longitude", ev.longitude ?: JSONObject.NULL)
+                put("accuracyMeters", ev.accuracyMeters ?: JSONObject.NULL)
+            }
+            jsonArray.put(obj)
+        }
+        prefs.edit { putString(KEY_EVENTS, jsonArray.toString()) }
+    }
+
     companion object {
         const val TAG = "DisconnectRecorder"
         private const val PREFS_NAME = "ble_disconnect_history_prefs"

@@ -46,6 +46,7 @@ class BleForegroundService : Service() {
 
     private var scanObserverJob: Job? = null
     private var disconnectObserverJob: Job? = null
+    private var inquiryJob: Job? = null
     private var scanningStarted = false
 
     override fun onCreate() {
@@ -69,6 +70,10 @@ class BleForegroundService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+
+        // Listening mode: don't start scanning immediately; wait for the selected
+        // device to connect, then start scanning automatically.
+        val listenMode = intent?.action == ACTION_LISTEN
 
         // Handle threshold updates propagated from the UI.
         if (intent?.action == ACTION_UPDATE_THRESHOLD) {
@@ -102,11 +107,16 @@ class BleForegroundService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
 
-        if (!scanningStarted) {
+        if (!scanningStarted && !listenMode) {
             tryStartScanning()
             scanningStarted = true
         }
         startObservers()
+
+        // In listen mode, start scanning when the selected device connects.
+        if (listenMode) {
+            startConnectionListener()
+        }
 
         return START_STICKY
     }
@@ -115,6 +125,11 @@ class BleForegroundService : Service() {
         scanningStarted = false
         scanObserverJob?.cancel()
         disconnectObserverJob?.cancel()
+        inquiryJob?.cancel()
+        if (connectionListenerRegistered) {
+            try { unregisterReceiver(connectionListener) } catch (e: Exception) {}
+            connectionListenerRegistered = false
+        }
         scanner.stopScan()
         ttsHelper.shutdown()
         serviceScope.cancel()
@@ -139,6 +154,38 @@ class BleForegroundService : Service() {
         scanner.startScan(activeMonitoring = true)
     }
 
+    private var connectionListenerRegistered = false
+    private val connectionListener = object : android.content.BroadcastReceiver() {
+        override fun onReceive(ctx: android.content.Context?, intent: android.content.Intent?) {
+            val action = intent?.action ?: return
+            if (action != android.bluetooth.BluetoothDevice.ACTION_ACL_CONNECTED) return
+            val device = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(android.bluetooth.BluetoothDevice.EXTRA_DEVICE, android.bluetooth.BluetoothDevice::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                intent.getParcelableExtra(android.bluetooth.BluetoothDevice.EXTRA_DEVICE)
+            } ?: return
+            if (selectedAddress != null && device.address.equals(selectedAddress, ignoreCase = true)) {
+                if (!scanningStarted) {
+                    tryStartScanning()
+                    scanningStarted = true
+                }
+            }
+        }
+    }
+
+    private fun startConnectionListener() {
+        if (connectionListenerRegistered) return
+        try {
+            val filter = android.content.IntentFilter(android.bluetooth.BluetoothDevice.ACTION_ACL_CONNECTED)
+            registerReceiver(connectionListener, filter)
+            connectionListenerRegistered = true
+            updateNotificationText("Auto-monitor: waiting for ${selectedName ?: selectedAddress} to connect")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to register connection listener", e)
+        }
+    }
+
     private fun startObservers() {
         scanObserverJob?.cancel()
         scanObserverJob = serviceScope.launch {
@@ -159,6 +206,18 @@ class BleForegroundService : Service() {
                     updateNotificationText("Disconnected: ${selectedName ?: selectedAddress}")
                 }
                 connectionMonitor.clearDisconnectEvent()
+            }
+        }
+
+        // Periodically re-run classic inquiry so a headset that resumes
+        // advertising (or answers inquiry) is picked up again after a gap.
+        inquiryJob?.cancel()
+        inquiryJob = serviceScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(60_000L)
+                if (scanner.isRssiStale()) {
+                    scanner.restartClassicInquiry()
+                }
             }
         }
     }
@@ -186,8 +245,8 @@ class BleForegroundService : Service() {
         val text = if (tracked == null) {
             "Monitoring ${selectedName ?: selectedAddress ?: "device"}"
         } else {
-            val dist = tracked.distanceMeters?.let { String.format("%.1f m", it) } ?: "—"
-            val rssi = tracked.rssi?.let { "$it dBm" } ?: "—"
+            val dist = tracked.distanceMeters?.let { String.format("%.1f m", it) } ?: "N/A"
+            val rssi = tracked.rssi?.let { "$it dBm" } ?: "N/A"
             val state = tracked.state.name.replace('_', ' ').lowercase().replaceFirstChar { it.uppercase() }
             "${selectedName ?: selectedAddress}: $dist ($rssi) • $state"
         }
@@ -249,12 +308,14 @@ class BleForegroundService : Service() {
     }
 
     companion object {
+        const val TAG = "BleForegroundService"
         const val NOTIFICATION_ID = 1001
         const val EXTRA_DEVICE_ADDRESS = "extra_device_address"
         const val EXTRA_DEVICE_NAME = "extra_device_name"
         const val EXTRA_THRESHOLD = "extra_threshold"
         const val ACTION_UPDATE_THRESHOLD = "com.example.bleproximityalert.action.UPDATE_THRESHOLD"
         const val ACTION_STOP = "com.example.bleproximityalert.action.STOP"
+        const val ACTION_LISTEN = "com.example.bleproximityalert.action.LISTEN"
 
         // Expose prefs keys for sharing with MainViewModel.
         const val PREFS_NAME = MainViewModel.PREFS_NAME

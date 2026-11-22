@@ -49,6 +49,8 @@ fun CalibrationWizardScreen(
     var step by remember { mutableStateOf(1) } // 1: 1m sample, 2: 3m sample, 3: result
     var isSampling by remember { mutableStateOf(false) }
     var countdown by remember { mutableStateOf(10) }
+    var sampleCount by remember { mutableStateOf(0) }
+    var targetSamples by remember { mutableStateOf(30) }
 
     var rssiAt1m by remember { mutableStateOf(-59.0) }
     var rssiAt3m by remember { mutableStateOf(-75.0) }
@@ -103,6 +105,7 @@ fun CalibrationWizardScreen(
                                 Spacer(modifier = Modifier.height(16.dp))
                                 if (isSampling) {
                                     Text("Sampling... $countdown s", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                                    Text("Collected $sampleCount / $targetSamples", style = MaterialTheme.typography.bodySmall)
                                 } else {
                                     Text("Sample 1m RSSI", style = MaterialTheme.typography.bodyLarge)
                                 }
@@ -118,6 +121,7 @@ fun CalibrationWizardScreen(
                                 Spacer(modifier = Modifier.height(16.dp))
                                 if (isSampling) {
                                     Text("Sampling... $countdown s", style = MaterialTheme.typography.headlineSmall, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+                                    Text("Collected $sampleCount / $targetSamples", style = MaterialTheme.typography.bodySmall)
                                 } else {
                                     Text("Sample 3m RSSI", style = MaterialTheme.typography.bodyLarge)
                                 }
@@ -147,12 +151,21 @@ fun CalibrationWizardScreen(
                         onClick = {
                             isSampling = true
                             countdown = 10
+                            sampleCount = 0
+                            val samples = mutableListOf<Double>()
                             scope.launch {
-                                for (i in 10 downTo 1) {
-                                    countdown = i
-                                    delay(1000L)
+                                val end = System.currentTimeMillis() + 10_000L
+                                while (System.currentTimeMillis() < end) {
+                                    countdown = ((end - System.currentTimeMillis()) / 1000L).toInt().coerceAtLeast(0)
+                                    selectedDevice?.rssi?.let { samples.add(it.toDouble()) }
+                                    sampleCount = samples.size
+                                    delay(333L)
                                 }
-                                rssiAt1m = (selectedDevice?.rssi ?: -58).toDouble()
+                                rssiAt1m = if (samples.isNotEmpty()) {
+                                    val sorted = samples.sorted()
+                                    val mid = sorted.size / 2
+                                    if (sorted.size % 2 == 0) (sorted[mid - 1] + sorted[mid]) / 2.0 else sorted[mid]
+                                } else (selectedDevice?.rssi ?: -58).toDouble()
                                 isSampling = false
                                 step = 2
                             }
@@ -167,12 +180,21 @@ fun CalibrationWizardScreen(
                         onClick = {
                             isSampling = true
                             countdown = 10
+                            sampleCount = 0
+                            val samples = mutableListOf<Double>()
                             scope.launch {
-                                for (i in 10 downTo 1) {
-                                    countdown = i
-                                    delay(1000L)
+                                val end = System.currentTimeMillis() + 10_000L
+                                while (System.currentTimeMillis() < end) {
+                                    countdown = ((end - System.currentTimeMillis()) / 1000L).toInt().coerceAtLeast(0)
+                                    selectedDevice?.rssi?.let { samples.add(it.toDouble()) }
+                                    sampleCount = samples.size
+                                    delay(333L)
                                 }
-                                rssiAt3m = (selectedDevice?.rssi ?: -74).toDouble()
+                                rssiAt3m = if (samples.isNotEmpty()) {
+                                    val sorted = samples.sorted()
+                                    val mid = sorted.size / 2
+                                    if (sorted.size % 2 == 0) (sorted[mid - 1] + sorted[mid]) / 2.0 else sorted[mid]
+                                } else (selectedDevice?.rssi ?: -74).toDouble()
                                 val computed = DistanceEstimator.computeCalibrationFromPoints(rssiAt1m, rssiAt3m, 3.0)
                                 computedN = computed.second
                                 isSampling = false
