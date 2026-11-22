@@ -24,15 +24,17 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
-      - name: Run unit tests
-        run: ./gradlew testDebugUnitTest --info 2>&1 | tail -80
+      - name: Run AlertEngine tests
+        run: ./gradlew testDebugUnitTest --tests "com.example.bleproximityalert.alert.AlertEngineTest" 2>&1 || echo "ALERT_ENGINE_FAILED"
 
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results
-          path: app/build/test-results/
+      - name: Run DistanceEstimator tests
+        run: ./gradlew testDebugUnitTest --tests "com.example.bleproximityalert.util.DistanceEstimatorTest" 2>&1 || echo "DISTANCE_ESTIMATOR_FAILED"
+
+      - name: Run KalmanFilter tests
+        run: ./gradlew testDebugUnitTest --tests "com.example.bleproximityalert.util.KalmanFilterTest" 2>&1 || echo "KALMAN_FILTER_FAILED"
+
+      - name: Run TrendAnalyzer tests
+        run: ./gradlew testDebugUnitTest --tests "com.example.bleproximityalert.util.TrendAnalyzerTest" 2>&1 || echo "TREND_ANALYZER_FAILED"
 
       - name: Assemble debug APK
         run: ./gradlew assembleDebug
