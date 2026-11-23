@@ -24,8 +24,8 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
-      - name: Run AlertEngineTest only
-        run: ./gradlew testDebugUnitTest --tests "com.example.bleproximityalert.alert.AlertEngineTest" 2>&1 | tail -30 || true
+      - name: Run unit tests
+        run: ./gradlew testDebugUnitTest
 
       - name: Assemble debug APK
         run: ./gradlew assembleDebug
